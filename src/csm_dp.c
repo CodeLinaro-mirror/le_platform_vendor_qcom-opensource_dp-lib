@@ -3,12 +3,14 @@
 * SPDX-License-Identifier: BSD-3-Clause-Clear
 */
 
+#define _GNU_SOURCE
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <netinet/in.h>
@@ -19,6 +21,7 @@
 #include <pcap.h>
 #include <pcap/dlt.h>
 #include <syslog.h>
+#include <limits.h>
 #include "csm_dp_api.h"
 #include "csm_dp_priv.h"
 
@@ -75,14 +78,11 @@ struct dp_cap_default_cbdata {
 };
 
 /* static data */
-static struct csm_dp_lib_data __libData = {
-	.fd = 0,
-	.flag = 0,
-	.logcfg = {
-		.level = LOG_DEBUG,
-		.output = CSM_DP_LOG_OUTPUT_SYSLOG,
-	},
-};
+
+bool lib_data_initialized;
+
+static struct csm_dp_lib_data
+	__libData[CSM_DP_MAX_BUS][CSM_DP_MAX_VF];
 
 static const struct csm_dp_cap_defcfg __default_cap_cfg = {
 	.file_name = DP_PCAP_DEFAULT_DIR"/csm_dp.pcap",
@@ -93,20 +93,20 @@ static const struct csm_dp_cap_defcfg __default_cap_cfg = {
 };
 
 /* declare */
-static int __ring_get_element(struct csm_dp_ring_hdl *,
+static int __ring_get_element(uint16_t, struct csm_dp_ring_hdl *,
 				csm_dp_ring_element_data_t *);
-static int __ring_put_element(struct csm_dp_ring_hdl *,
+static int __ring_put_element(uint16_t, struct csm_dp_ring_hdl *,
 				csm_dp_ring_element_data_t);
 
 static int __csm_dp_rtx_hook(
+	uint16_t handle,
 	struct iovec *iov,
 	unsigned int iovcnt,
 	unsigned int event_id,
 	enum csm_dp_channel ch);
 static void *__capture_thread_main(void *);
-static int __config_cap_hdl_default(struct csm_dp_cap_hdl *caphdl, const struct csm_dp_cap_defcfg *cfg);
-
-static unsigned int __csm_dp_num_alloc_tx_buf_tx_in_progress;
+static int __config_cap_hdl_default(uint16_t handle, struct csm_dp_cap_hdl *caphdl,
+				    const struct csm_dp_cap_defcfg *cfg);
 
 /* inlines */
 static inline bool csm_dp_log_output_is_valid(int output)
@@ -139,9 +139,48 @@ static inline size_t get_offset(void *addr, void* base)
 	return ((size_t)addr - (size_t)base);
 }
 
-static inline bool csm_dp_is_inited(void)
+unsigned int csm_dp_get_bus_index(uint16_t handle)
 {
-	return (__libData.flag & LIB_FLAG_INITED);
+	unsigned int bus = handle & 0xF;
+	if (bus >= CSM_DP_MAX_BUS)
+		return INVALID_HANDLE;
+
+	return bus;
+}
+
+unsigned int csm_dp_get_vf_index(uint16_t handle)
+{
+	unsigned int vf = (handle & 0xF0) >> 4;
+	if (vf >= CSM_DP_MAX_VF)
+		return INVALID_HANDLE;
+
+	return vf;
+}
+
+uint16_t csm_dp_get_handle(int fd) {
+	int bus_index, vf_index;
+	uint16_t handle = INVALID_HANDLE;
+
+	if (fd < 0)
+		return handle;
+
+	for (bus_index = 0; bus_index < CSM_DP_MAX_BUS; bus_index++) {
+		for (vf_index = 0; vf_index < CSM_DP_MAX_VF; vf_index++) {
+			if (__libData[bus_index][vf_index].fd == fd) {
+				handle = bus_index | (vf_index << 4);
+				return handle;
+			}
+		}
+	}
+	return handle;
+}
+
+static inline bool csm_dp_is_inited(uint16_t handle)
+{
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
+
+	return (__libData[bus][vf].flag & LIB_FLAG_INITED);
 }
 
 static inline unsigned int ptr_to_buf_index(struct csm_dp_mem_hdl *memhdl,
@@ -249,14 +288,19 @@ static inline struct csm_dp_buf_cntrl *csm_dp_get_buf_overhead(const void *ptr)
 }
 
 /* To find mempool handler that the buffer belongs to */
-static struct csm_dp_mempool_hdl *__find_mempool(const void *ptr)
+static struct csm_dp_mempool_hdl *__find_mempool(uint16_t handle, const void *ptr)
 {
 	struct csm_dp_buf_cntrl *buf_cntrl = csm_dp_get_buf_overhead(ptr);
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
+
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return NULL;
 
 	if (buf_cntrl->mem_type >= CSM_DP_MEM_TYPE_LAST)
 		return NULL;
 
-	return __libData.hdl[buf_cntrl->mem_type];
+	return __libData[bus][vf].hdl[buf_cntrl->mem_type];
 }
 
 /* To increase reference number of bufobj which is associated with given address */
@@ -269,7 +313,9 @@ static inline void __mempool_hold_buf(struct csm_dp_mempool_hdl *hdl, void *bufp
 }
 
 /* To decrease reference number of bufobj. Free the buffer if it reaches zero */
-static inline void __mempool_put_buf(struct csm_dp_mempool_hdl *hdl, void *bufptr)
+static inline void __mempool_put_buf(uint16_t handle,
+				     struct csm_dp_mempool_hdl *hdl,
+				     void *bufptr)
 {
 	struct csm_dp_bufobj *bufobj = ptr_to_bufobj(&hdl->mem_hdl, bufptr);
 
@@ -279,16 +325,16 @@ static inline void __mempool_put_buf(struct csm_dp_mempool_hdl *hdl, void *bufpt
 		if (refcnt == 1) {
 			bufobj->handle = 0xdeadbeef;
 			if (hdl->ops.free_buf)
-				hdl->ops.free_buf(hdl, bufptr);
+				hdl->ops.free_buf(handle, hdl, bufptr);
 		}
 		else if (refcnt <= 0) {
-			DP_LOG_ERR("buffer already freed, addr=%p\n", bufptr);
+			DP_LOG_ERR(handle, "buffer already freed, addr=%p\n", bufptr);
 		}
 	}
 }
 
 /* To free all the buffers which are hold by user */
-static void __mempool_release_all_bufs(struct csm_dp_mempool_hdl *hdl)
+static void __mempool_release_all_bufs(uint16_t handle, struct csm_dp_mempool_hdl *hdl)
 {
 	struct csm_dp_mem_hdl *memhdl = &hdl->mem_hdl;
 
@@ -301,7 +347,7 @@ static void __mempool_release_all_bufs(struct csm_dp_mempool_hdl *hdl)
 
 			if (atomic_read(&bufobj[i].refcnt) > 0) {
 				if (hdl->ops.free_buf)
-					hdl->ops.free_buf(hdl, buf);
+					hdl->ops.free_buf(handle, hdl, buf);
 
 			}
 		}
@@ -309,49 +355,49 @@ static void __mempool_release_all_bufs(struct csm_dp_mempool_hdl *hdl)
 }
 
 #ifdef DRIVER_API_DEBUG
-static void __mempool_cfg_dump(struct csm_dp_mempool_cfg *cfg)
+static void __mempool_cfg_dump(uint16_t handle, struct csm_dp_mempool_cfg *cfg)
 {
-	DP_LOG_DEBUG("Type:                %u\n", cfg->type);
-	DP_LOG_DEBUG("MEM:\n");
-	DP_LOG_DEBUG("   size:             %u\n", cfg->mem.mmap.length);
-	DP_LOG_DEBUG("   mmap_cookie:      %08x\n", cfg->mem.mmap.cookie);
-	DP_LOG_DEBUG("   mmap_offset:      %08x\n", cfg->mem.mmap.offset);
-	DP_LOG_DEBUG("   bufSize:          %u\n", cfg->mem.buf_sz);
-	DP_LOG_DEBUG("   bufCount:         %u\n", cfg->mem.buf_cnt);
-	DP_LOG_DEBUG("   bufOverhead:      %u\n", cfg->mem.buf_overhead_sz);
-	DP_LOG_DEBUG("RING:\n");
-	DP_LOG_DEBUG("   memSize:          %u\n", cfg->ring.mmap.length);
-	DP_LOG_DEBUG("   mmap_cookie:      %08x\n", cfg->ring.mmap.cookie);
-	DP_LOG_DEBUG("   mmap_offset:      %08x\n", cfg->ring.mmap.offset);
-	DP_LOG_DEBUG("   ringSize:         %u\n", cfg->ring.size);
-	DP_LOG_DEBUG("   ProdHdrOffset:    %08x\n", cfg->ring.prod_head_off);
-	DP_LOG_DEBUG("   ProdTailOffset:   %08x\n", cfg->ring.prod_tail_off);
-	DP_LOG_DEBUG("   ConsHdrOffset:    %08x\n", cfg->ring.cons_head_off);
-	DP_LOG_DEBUG("   ConsTailOffset:   %08x\n", cfg->ring.cons_tail_off);
-	DP_LOG_DEBUG("   RingBufOffset:    %08x\n", cfg->ring.ringbuf_off);
+	DP_LOG_DEBUG(handle, "Type:                %u\n", cfg->type);
+	DP_LOG_DEBUG(handle, "MEM:\n");
+	DP_LOG_DEBUG(handle, "   size:             %u\n", cfg->mem.mmap.length);
+	DP_LOG_DEBUG(handle, "   mmap_cookie:      %08x\n", cfg->mem.mmap.cookie);
+	DP_LOG_DEBUG(handle, "   mmap_offset:      %08x\n", cfg->mem.mmap.offset);
+	DP_LOG_DEBUG(handle, "   bufSize:          %u\n", cfg->mem.buf_sz);
+	DP_LOG_DEBUG(handle, "   bufCount:         %u\n", cfg->mem.buf_cnt);
+	DP_LOG_DEBUG(handle, "   bufOverhead:      %u\n", cfg->mem.buf_overhead_sz);
+	DP_LOG_DEBUG(handle, "RING:\n");
+	DP_LOG_DEBUG(handle, "   memSize:          %u\n", cfg->ring.mmap.length);
+	DP_LOG_DEBUG(handle, "   mmap_cookie:      %08x\n", cfg->ring.mmap.cookie);
+	DP_LOG_DEBUG(handle, "   mmap_offset:      %08x\n", cfg->ring.mmap.offset);
+	DP_LOG_DEBUG(handle, "   ringSize:         %u\n", cfg->ring.size);
+	DP_LOG_DEBUG(handle, "   ProdHdrOffset:    %08x\n", cfg->ring.prod_head_off);
+	DP_LOG_DEBUG(handle, "   ProdTailOffset:   %08x\n", cfg->ring.prod_tail_off);
+	DP_LOG_DEBUG(handle, "   ConsHdrOffset:    %08x\n", cfg->ring.cons_head_off);
+	DP_LOG_DEBUG(handle, "   ConsTailOffset:   %08x\n", cfg->ring.cons_tail_off);
+	DP_LOG_DEBUG(handle, "   RingBufOffset:    %08x\n", cfg->ring.ringbuf_off);
 }
 #endif
 
 /* Default buffer allocator */
-static void *__default_alloc_buf(struct csm_dp_mempool_hdl *hdl)
+static void *__default_alloc_buf(uint16_t handle, struct csm_dp_mempool_hdl *hdl)
 {
 	struct csm_dp_mem_hdl *mem_hdl = &hdl->mem_hdl;
 	csm_dp_ring_element_data_t offset;
 	char *buf = NULL;
 	struct csm_dp_buf_cntrl *p;
 
-	while (!__ring_get_element(&hdl->ring_hdl, &offset)) {
+	while (!__ring_get_element(handle, &hdl->ring_hdl, &offset)) {
 		/* Ring contains offset */
 		if (is_offset_in_range(offset, 0, mem_hdl->size) &&
 		    is_offset_in_range(offset + mem_hdl->bufsz - 1, 0, mem_hdl->size)) {
 			buf = (char *)mem_hdl->base + offset;
 			break;
 		}
-		DP_LOG_ERR("Got invalid data from ring, data=0x%lx\n", offset);
+		DP_LOG_ERR(handle, "Got invalid data from ring, data=0x%lx\n", offset);
 	}
 
 	if (!buf) {
-		DP_LOG_ERR("No data in ring!\n");
+		DP_LOG_ERR(handle, "No data in ring!\n");
 		return NULL;
 	}
 
@@ -360,7 +406,7 @@ static void *__default_alloc_buf(struct csm_dp_mempool_hdl *hdl)
 #ifdef CSM_DP_BUFFER_FENCING
 	if (p->fence != CSM_DP_BUFFER_FENCE_SIG ||
 			p->signature != CSM_DP_BUFFER_SIG) {
-		DP_LOG_ERR(
+		DP_LOG_ERR(handle,
 			"%s: mem handle %p buffer corrupted,"
 			" offset 0x%lx, fence 0x%x, expect 0x%x,"
 			" signature 0x%x, expect 0x%x,"
@@ -375,7 +421,7 @@ static void *__default_alloc_buf(struct csm_dp_mempool_hdl *hdl)
 }
 
 /* Default buffer deallocator */
-static void __default_free_buf(struct csm_dp_mempool_hdl *hdl, void *buf)
+static void __default_free_buf(uint16_t handle, struct csm_dp_mempool_hdl *hdl, void *buf)
 {
 	struct csm_dp_buf_cntrl *p;
 
@@ -388,7 +434,7 @@ static void __default_free_buf(struct csm_dp_mempool_hdl *hdl, void *buf)
 #ifdef CSM_DP_BUFFER_FENCING
 	if (p->fence != CSM_DP_BUFFER_FENCE_SIG ||
 			p->signature != CSM_DP_BUFFER_SIG) {
-		DP_LOG_ERR(
+		DP_LOG_ERR(handle,
 			"%s: mem handle %p buffer corrupted,"
 			" offset 0x%lx, fence 0x%x, expect 0x%x,"
 			" signature 0x%x, expect 0x%x,"
@@ -407,15 +453,15 @@ static void __default_free_buf(struct csm_dp_mempool_hdl *hdl, void *buf)
 		 * If not, give a warning.
 		 */
 		p->state = CSM_DP_BUF_STATE_USER_FREE;
-		if (__ring_put_element(&hdl->ring_hdl, offset))
-			DP_LOG_ERR("Failed to put data into ring, data=0x%lx\n", offset);
+		if (__ring_put_element(handle, &hdl->ring_hdl, offset))
+			DP_LOG_ERR(handle, "Failed to put data into ring, data=0x%lx\n", offset);
 	}
 }
 
 /* Default mempool release */
-static void __default_release(struct csm_dp_mempool_hdl *hdl)
+static void __default_release(uint16_t handle, struct csm_dp_mempool_hdl *hdl)
 {
-	__mempool_release_all_bufs(hdl);
+	__mempool_release_all_bufs(handle, hdl);
 }
 
 /*
@@ -423,15 +469,22 @@ static void __default_release(struct csm_dp_mempool_hdl *hdl)
  * - mmap the ring buffer into user space
  * - initialize the ring cons/prod pointer
 */
-static int __init_ring_hdl(struct csm_dp_ring_hdl *hdl, struct csm_dp_ring_cfg *cfg)
+static int __init_ring_hdl(uint16_t handle,
+			   struct csm_dp_ring_hdl *hdl,
+			   struct csm_dp_ring_cfg *cfg)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	struct csm_dp_mmap_cfg *mmap_cfg = &cfg->mmap;
 	char *ptr;
 
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
 	ptr = mmap(NULL, mmap_cfg->length, PROT_READ | PROT_WRITE, MAP_SHARED,
-		   __libData.fd, mmap_cfg->cookie);
+		   __libData[bus][vf].fd, mmap_cfg->cookie);
 	if (ptr == MAP_FAILED) {
-		DP_LOG_ERR("Failed to mmap ring memory, length=%llu cookie=0x%x\n",
+		DP_LOG_ERR(handle, "Failed to mmap ring memory, length=%llu cookie=0x%x\n",
 			mmap_cfg->length, mmap_cfg->cookie);
 		return -EAGAIN;
 	}
@@ -446,7 +499,7 @@ static int __init_ring_hdl(struct csm_dp_ring_hdl *hdl, struct csm_dp_ring_cfg *
 	hdl->prod_tail = (csm_dp_ring_index_t *)(ptr + cfg->prod_tail_off);
 	hdl->ringbuf = (csm_dp_ring_element_t *)(ptr + cfg->ringbuf_off);
 
-	DP_LOG_DEBUG("Ring is mapped, addr=%p length=0x%lx cons_head=%p cons_tail=%p "
+	DP_LOG_DEBUG(handle, "Ring is mapped, addr=%p length=0x%lx cons_head=%p cons_tail=%p "
 		  "prod_head=%p prod_tail=%p ringbuf=%p\n",
 		  hdl->loc.base, hdl->loc.length, hdl->cons_head, hdl->cons_tail,
 		  hdl->prod_head, hdl->prod_tail, hdl->ringbuf);
@@ -462,7 +515,9 @@ static void __cleanup_ring_hdl(struct csm_dp_ring_hdl *hdl)
 	}
 }
 
-static int __ring_hdl_alloc_ring(struct csm_dp_ring_hdl *hdl, unsigned int elements)
+static int __ring_hdl_alloc_ring(uint16_t handle,
+				 struct csm_dp_ring_hdl *hdl,
+				 unsigned int elements)
 {
 	unsigned int ring_sz = calc_ring_size(elements);
 	unsigned int alloc_sz = ring_sz * sizeof(csm_dp_ring_element_t);
@@ -474,7 +529,7 @@ static int __ring_hdl_alloc_ring(struct csm_dp_ring_hdl *hdl, unsigned int eleme
 	alloc_sz += 4 * CSM_DP_L1_CACHE_BYTES;
 	ptr = (char *)aligned_alloc(CSM_DP_L1_CACHE_BYTES, alloc_sz);
 	if (!ptr) {
-		DP_LOG_ERR("Failed to allocate memory\n");
+		DP_LOG_ERR(handle, "Failed to allocate memory\n");
 		return -ENOMEM;
 	}
 
@@ -497,15 +552,16 @@ static int __ring_hdl_alloc_ring(struct csm_dp_ring_hdl *hdl, unsigned int eleme
 }
 
 /* To read one element from ring buffer */
-static int __ring_get_element(struct csm_dp_ring_hdl *hdl,
-				csm_dp_ring_element_data_t *pdata)
+static int __ring_get_element(uint16_t handle,
+			      struct csm_dp_ring_hdl *hdl,
+			      csm_dp_ring_element_data_t *pdata)
 {
 	register csm_dp_ring_index_t cons_head, cons_next;
 	register csm_dp_ring_index_t prod_tail, mask;
 	csm_dp_ring_element_data_t data;
 
 	if (!hdl || !pdata) {
-		DP_LOG_ERR("%s: null pointer!\n", __func__);
+		DP_LOG_ERR(handle, "%s: null pointer!\n", __func__);
 		return -EINVAL;
 	}
 
@@ -548,14 +604,15 @@ again:
 }
 
 /* To put one element into ring buffer */
-static int __ring_put_element(struct csm_dp_ring_hdl *hdl,
-			csm_dp_ring_element_data_t data)
+static int __ring_put_element(uint16_t handle,
+			      struct csm_dp_ring_hdl *hdl,
+			      csm_dp_ring_element_data_t data)
 {
 	register csm_dp_ring_index_t prod_head, prod_next;
 	register csm_dp_ring_index_t cons_tail, mask;
 
 	if (!hdl) {
-		DP_LOG_ERR("%s: null pointer!\n", __func__);
+		DP_LOG_ERR(handle, "%s: null pointer!\n", __func__);
 		return -EINVAL;
 	}
 
@@ -598,15 +655,22 @@ again:
  * - initialize the handler
  * - allocate bufobj to track the buffer usage
  */
-static int __init_mem_hdl(struct csm_dp_mem_hdl *hdl, struct csm_dp_mem_cfg *cfg)
+static int __init_mem_hdl(uint16_t handle,
+			  struct csm_dp_mem_hdl *hdl,
+			  struct csm_dp_mem_cfg *cfg)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	struct csm_dp_mmap_cfg *mmap_cfg = &cfg->mmap;
 	void *ptr;
 
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
 	ptr = mmap(NULL, mmap_cfg->length, PROT_READ | PROT_WRITE, MAP_SHARED,
-		   __libData.fd, mmap_cfg->cookie);
+		   __libData[bus][vf].fd, mmap_cfg->cookie);
 	if (ptr == MAP_FAILED) {
-		DP_LOG_ERR("Failed to mmap buffer memory, length=%llu cookie=0x%x\n",
+		DP_LOG_ERR(handle, "Failed to mmap buffer memory, length=%llu cookie=0x%x\n",
 			mmap_cfg->length, mmap_cfg->cookie);
 		return -EAGAIN;
 	}
@@ -628,11 +692,11 @@ static int __init_mem_hdl(struct csm_dp_mem_hdl *hdl, struct csm_dp_mem_cfg *cfg
 
 	hdl->buf_objs = calloc(hdl->bufcnt, sizeof(*hdl->buf_objs));
 	if (!hdl->buf_objs) {
-		DP_LOG_ERR("Failed to allocate buffer object\n");
+		DP_LOG_ERR(handle, "Failed to allocate buffer object\n");
 		return -ENOMEM;
 	}
 
-	DP_LOG_DEBUG("Map memory into user space, mmap_retaddr=%p mmap_len=0x%lx base=%p size=0x%lx\n",
+	DP_LOG_DEBUG(handle, "Map memory into user space, mmap_retaddr=%p mmap_len=0x%lx base=%p size=0x%lx\n",
 		  hdl->loc.base, hdl->loc.length, hdl->base, hdl->size);
 	return 0;
 }
@@ -654,13 +718,14 @@ static void __cleanup_mem_hdl(struct csm_dp_mem_hdl *hdl)
 }
 
 /* To create mempool handler */
-static struct csm_dp_mempool_hdl *__create_mempool_hdl(enum csm_dp_mem_type type)
+static struct csm_dp_mempool_hdl *__create_mempool_hdl(uint16_t handle,
+						       enum csm_dp_mem_type type)
 {
 	struct csm_dp_mempool_hdl *hdl;
 
 	hdl = malloc(sizeof(*hdl));
 	if (!hdl) {
-		DP_LOG_ERR("Failed to allocate handler!\n");
+		DP_LOG_ERR(handle, "Failed to allocate handler!\n");
 		return NULL;
 	}
 
@@ -681,10 +746,12 @@ static struct csm_dp_mempool_hdl *__create_mempool_hdl(enum csm_dp_mem_type type
 	return hdl;
 }
 
-void __sync_rx_ring_hdl(enum csm_dp_rx_type type, struct csm_dp_ring_hdl *hdl)
+void __sync_rx_ring_hdl(uint16_t handle,
+			enum csm_dp_rx_type type,
+			struct csm_dp_ring_hdl *hdl)
 {
 	if (*hdl->cons_head != *hdl->cons_tail) {
-		DP_LOG_ERR(
+		DP_LOG_ERR(handle,
 			"%s: rx_ring type %d, consumer head %d "
 			"does not match consumer tail %d\n",
 			__func__, type, *hdl->cons_head, *hdl->cons_tail);
@@ -700,14 +767,19 @@ void __sync_rx_ring_hdl(enum csm_dp_rx_type type, struct csm_dp_ring_hdl *hdl)
  * - initialize memory handler
  * - initialize ring handler
  */
-static int __init_mempool_hdl(
+static int __init_mempool_hdl(uint16_t handle,
 	struct csm_dp_mempool_hdl *hdl,
 	unsigned int bufsz,
 	unsigned int bufcnt)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	struct csm_dp_ioctl_mempool_alloc req;
 	struct csm_dp_mempool_cfg cfg;
 	int ret;
+
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
 
 	req.type = hdl->type;
 	req.buf_num = bufcnt;
@@ -715,39 +787,40 @@ static int __init_mempool_hdl(
 	req.cfg = &cfg;
 
 	/* Let kernel allocate memory */
-	ret = ioctl(__libData.fd, CSM_DP_IOCTL_MEMPOOL_ALLOC, &req);
+	ret = ioctl(__libData[bus][vf].fd,
+		    CSM_DP_IOCTL_MEMPOOL_ALLOC, &req);
 	if (ret) {
-		DP_LOG_ERR("CSM_DP_IOCTL_MEM_ALLOC ioctl failed, err=%d\n", ret);
+		DP_LOG_ERR(handle, "CSM_DP_IOCTL_MEM_ALLOC ioctl failed, err=%d\n", ret);
 		return ret;
 	}
 
 #ifdef DRIVER_API_CHECK
 	if (cfg.mem.buf_sz < bufsz) {
-		DP_LOG_ERR("API-CHECK: failed, buf_sz %u, expect %u\n", cfg.mem.buf_sz, req.buf_sz);
+		DP_LOG_ERR(handle, "API-CHECK: failed, buf_sz %u, expect %u\n", cfg.mem.buf_sz, req.buf_sz);
 		return -EINVAL;
 	}
 	if (cfg.mem.buf_cnt < bufcnt) {
-		DP_LOG_ERR("API-CHECK: failed, buf_cnt %u, expect %u\n", cfg.mem.buf_cnt, bufCnt);
+		DP_LOG_ERR(handle, "API-CHECK: failed, buf_cnt %u, expect %u\n", cfg.mem.buf_cnt, bufCnt);
 		return -EINVAL;
 	}
 	if (cfg.type != hdl->type) {
-		DP_LOG_ERR("API-CHECK: failed, type %u, expect %u\n", cfg.type, hdl->type);
+		DP_LOG_ERR(handle, "API-CHECK: failed, type %u, expect %u\n", cfg.type, hdl->type);
 		return -EINVAL;
 	}
 #endif
 
 #ifdef DRIVER_API_DEBUG
-	__mempool_cfg_dump(&cfg);
+	__mempool_cfg_dump(&cfg, handle);
 #endif
 
 	/* mmap buffer memory */
-	if (__init_mem_hdl(&hdl->mem_hdl, &cfg.mem)) {
-		DP_LOG_ERR("Failed to initialize memory handler!\n");
+	if (__init_mem_hdl(handle, &hdl->mem_hdl, &cfg.mem)) {
+		DP_LOG_ERR(handle, "Failed to initialize memory handler!\n");
 		return -EAGAIN;
 	}
 
-	if (__init_ring_hdl(&hdl->ring_hdl, &cfg.ring)) {
-		DP_LOG_ERR("Failed to initialize ring handler!\n");
+	if (__init_ring_hdl(handle, &hdl->ring_hdl, &cfg.ring)) {
+		DP_LOG_ERR(handle, "Failed to initialize ring handler!\n");
 		return -EAGAIN;
 	}
 
@@ -762,11 +835,11 @@ static int __init_mempool_hdl(
  * - cleanup memory handler
  * - free mempool handler
 */
-static void __free_mempool_hdl(struct csm_dp_mempool_hdl *hdl)
+static void __free_mempool_hdl(uint16_t handle, struct csm_dp_mempool_hdl *hdl)
 {
 	if (hdl) {
 		if (hdl->ops.release)
-			hdl->ops.release(hdl);
+			hdl->ops.release(handle, hdl);
 		__cleanup_ring_hdl(&hdl->ring_hdl);
 		__cleanup_mem_hdl(&hdl->mem_hdl);
 		free(hdl);
@@ -776,13 +849,14 @@ static void __free_mempool_hdl(struct csm_dp_mempool_hdl *hdl)
 /*
  * To allocate rx handler
  */
-static struct csm_dp_rx_hdl *__create_rx_hdl(enum csm_dp_mmap_type type)
+static struct csm_dp_rx_hdl *__create_rx_hdl(uint16_t handle,
+					     enum csm_dp_mmap_type type)
 {
 	struct csm_dp_rx_hdl *rxhdl;
 
 	rxhdl = malloc(sizeof(*rxhdl));
 	if (!rxhdl) {
-		DP_LOG_ERR("%s: memory allocation failed!\n", __func__);
+		DP_LOG_ERR(handle, "%s: memory allocation failed!\n", __func__);
 		return NULL;
 	}
 
@@ -795,30 +869,38 @@ static struct csm_dp_rx_hdl *__create_rx_hdl(enum csm_dp_mmap_type type)
  * - get RX ring config from kernel
  * - map RX ring into user space
 */
-static int __init_rx_hdl(struct csm_dp_rx_hdl *hdl)
+static int __init_rx_hdl(uint16_t handle,
+			 struct csm_dp_rx_hdl *hdl)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	struct csm_dp_ring_cfg cfg;
 	struct csm_dp_ioctl_getcfg req;
 	int ret;
+
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
 
 	memset(&cfg, 0, sizeof(cfg));
 	req.type = hdl->type;
 	req.cfg = &cfg;
 
-	ret = ioctl(__libData.fd, CSM_DP_IOCTL_RX_GET_CONFIG, &req);
+	ret = ioctl(__libData[bus][vf].fd,
+		    CSM_DP_IOCTL_RX_GET_CONFIG,
+		    &req);
 	if (ret) {
-		DP_LOG_ERR("CSM_DP_IOCTL_RX_GET_CONFIG failed, err=%d\n", ret);
+		DP_LOG_ERR(handle, "CSM_DP_IOCTL_RX_GET_CONFIG failed, err=%d\n", ret);
 		return ret;
 	}
 
-	ret = __init_ring_hdl(&hdl->ring_hdl, &cfg);
+	ret = __init_ring_hdl(handle, &hdl->ring_hdl, &cfg);
 	if (ret) {
-		DP_LOG_ERR("Failed to initalize rx ring handler!\n");
+		DP_LOG_ERR(handle, "Failed to initalize rx ring handler!\n");
 		return ret;
 	}
 
-	__sync_rx_ring_hdl(hdl->type, &hdl->ring_hdl);
-	DP_LOG_DEBUG("Initialized rx handler, rx_type=%u\n", hdl->type);
+	__sync_rx_ring_hdl(handle, hdl->type, &hdl->ring_hdl);
+	DP_LOG_DEBUG(handle, "Initialized rx handler, rx_type=%u\n", hdl->type);
 
 	return 0;
 }
@@ -831,7 +913,9 @@ static void __free_rx_hdl(struct csm_dp_rx_hdl *hdl)
 }
 
 /* Initialize capture event handler */
-static int __init_cap_event_hdl(struct csm_dp_cap_event_hdl *hdl, unsigned int event_cnt)
+static int __init_cap_event_hdl(uint16_t handle,
+				struct csm_dp_cap_event_hdl *hdl,
+				unsigned int event_cnt)
 {
 	struct csm_dp_cap_event *event;
 	int ret = 0;
@@ -839,27 +923,27 @@ static int __init_cap_event_hdl(struct csm_dp_cap_event_hdl *hdl, unsigned int e
 
 	event = malloc(event_cnt * sizeof(struct csm_dp_cap_event));
 	if (!event) {
-		DP_LOG_ERR("Failed to allocate memory for capture event\n");
+		DP_LOG_ERR(handle, "Failed to allocate memory for capture event\n");
 		return -ENOMEM;
 	}
 
-	ret = __ring_hdl_alloc_ring(&hdl->event_ring, event_cnt);
+	ret = __ring_hdl_alloc_ring(handle, &hdl->event_ring, event_cnt);
 	if (ret) {
-		DP_LOG_ERR("Failed to allocate event ring\n");
+		DP_LOG_ERR(handle, "Failed to allocate event ring\n");
 		free(event);
 		return ret;
 	}
 
-	ret = __ring_hdl_alloc_ring(&hdl->free_ring, event_cnt);
+	ret = __ring_hdl_alloc_ring(handle, &hdl->free_ring, event_cnt);
 	if (ret) {
-		DP_LOG_ERR("Failed to allocate free ring\n");
+		DP_LOG_ERR(handle, "Failed to allocate free ring\n");
 		__cleanup_ring_hdl(&hdl->event_ring);
 		free(event);
 		return ret;
 	}
 
 	for (i = 0; i < event_cnt; i++)
-		__ring_put_element(&hdl->free_ring, (csm_dp_ring_element_data_t)&event[i]);
+		__ring_put_element(handle, &hdl->free_ring, (csm_dp_ring_element_data_t)&event[i]);
 
 	hdl->event_mem = event;
 	return 0;
@@ -881,33 +965,44 @@ static void __cleanup_cap_event_hdl(struct csm_dp_cap_event_hdl *hdl)
  * - install callback function
  * - start capture pthread
  */
-static int __init_cap_hdl(
+static int __init_cap_hdl(uint16_t handle,
 	struct csm_dp_cap_hdl *hdl,
 	const struct csm_dp_cap_cb_ops *cb_ops,
 	void *cookie,
 	unsigned int event_num)
 {
 	int ret;
+	char thread_name[30] = {0x00};
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 
-	ret = __init_cap_event_hdl(&hdl->event_hdl, event_num);
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	hdl->handle = handle;
+
+	ret = __init_cap_event_hdl(handle, &hdl->event_hdl, event_num);
 	if (ret) {
-		DP_LOG_ERR("Failed to initialize cap_event handler\n");
+		DP_LOG_ERR(handle, "Failed to initialize cap_event handler\n");
 		return ret;
 	}
 	if (cb_ops) {
 		hdl->priv_data = cookie;
 		memcpy(&hdl->ops, cb_ops, sizeof(hdl->ops));
-	} else if ((ret = __config_cap_hdl_default(hdl, cookie))) {
-		DP_LOG_ERR("Failed to config default cap handling\n");
+	} else if ((ret = __config_cap_hdl_default(handle, hdl, cookie))) {
+		DP_LOG_ERR(handle, "Failed to config default cap handling\n");
 		return ret;
 	}
 
 	ret = sem_init(&hdl->sem, 0, 0);
 	if (ret) {
-		DP_LOG_ERR("Failed to initialize semaphore\n");
+		DP_LOG_ERR(handle, "Failed to initialize semaphore\n");
 		return ret;
 	}
 	ret = pthread_create(&hdl->pid, NULL, __capture_thread_main, hdl);
+	snprintf(thread_name, sizeof(thread_name), "CAPTURE_%u_%u",
+		bus, vf);
+	pthread_setname_np(hdl->pid, thread_name);
 
 	return ret;
 }
@@ -921,21 +1016,22 @@ static void __cleanup_cap_hdl(struct csm_dp_cap_hdl *hdl)
 	sem_destroy(&hdl->sem);
 }
 
-static inline struct csm_dp_cap_event *__ring_get_cap_event(struct csm_dp_ring_hdl *hdl)
+static inline struct csm_dp_cap_event *__ring_get_cap_event(uint16_t handle,
+							    struct csm_dp_ring_hdl *hdl)
 {
 	struct csm_dp_cap_event *event;
 
-	if (__ring_get_element(hdl, (csm_dp_ring_element_data_t *)&event))
+	if (__ring_get_element(handle, hdl, (csm_dp_ring_element_data_t *)&event))
 		return NULL;
 	return event;
 }
 
-static inline void __ring_put_cap_event(
-	struct csm_dp_ring_hdl *hdl,
-	struct csm_dp_cap_event *event)
+static inline void __ring_put_cap_event(uint16_t handle,
+					struct csm_dp_ring_hdl *hdl,
+					struct csm_dp_cap_event *event)
 {
 	if (event)
-		__ring_put_element(hdl, (csm_dp_ring_element_data_t)event);
+		__ring_put_element(handle, hdl, (csm_dp_ring_element_data_t)event);
 }
 
 static int __init_dp_log(const struct csm_dp_log_cfg *cfg)
@@ -950,12 +1046,21 @@ static int __init_dp_log(const struct csm_dp_log_cfg *cfg)
 	return 0;
 }
 
-void csm_dp_log(int level, const char *fmt, ...)
+void csm_dp_log(uint16_t handle, int level, const char *fmt, ...)
 {
-	struct csm_dp_log_cfg *logcfg = &__libData.logcfg;
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
+	struct csm_dp_log_cfg *logcfg;
 	va_list args;
 
-	if (unlikely(!csm_dp_is_inited()))
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF) {
+		printf("%s failed \n", __func__);
+		return;
+	}
+
+	logcfg = &__libData[bus][vf].logcfg;
+
+	if (unlikely(!csm_dp_is_inited(handle)))
 		return;
 	if (level > logcfg->level)
 		return;
@@ -993,30 +1098,36 @@ static int __cleanup_dp_log(struct csm_dp_log_cfg *cfg)
  * To create and initialize DP memory pool. Mutex is locked
 */
 static int __csm_dp_init_mem(
+	uint16_t handle,
 	enum csm_dp_mem_type type,
 	unsigned int bufsz,
 	unsigned int bufcnt)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	struct csm_dp_mempool_hdl *hdl = NULL;
 	int ret = 0;
 
-	if (__libData.hdl[type]) {
-		DP_LOG_WARN("mempool handler created!\n");
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	if (__libData[bus][vf].hdl[type]) {
+		DP_LOG_WARN(handle, "mempool handler created!\n");
 		return -EBUSY;
 	}
-	hdl = __create_mempool_hdl(type);
+	hdl = __create_mempool_hdl(handle, type);
 	if (hdl == NULL) {
-		DP_LOG_ERR("Failed to create mempool_hdl, type=%u, bufCnt=%u\n", type, bufcnt);
+		DP_LOG_ERR(handle, "Failed to create mempool_hdl, type=%u, bufCnt=%u\n", type, bufcnt);
 		return -ENOMEM;
 	}
-	ret = __init_mempool_hdl(hdl, bufsz, bufcnt);
+	ret = __init_mempool_hdl(handle, hdl, bufsz, bufcnt);
 	if (ret) {
-		DP_LOG_ERR("Failed to initialize memhdl!\n");
-		__free_mempool_hdl(hdl);
+		DP_LOG_ERR(handle, "Failed to initialize memhdl!\n");
+		__free_mempool_hdl(handle, hdl);
 		return ret;
 	}
 
-	__libData.hdl[type] = hdl;
+	__libData[bus][vf].hdl[type] = hdl;
 
 	return 0;
 }
@@ -1029,37 +1140,82 @@ static int __csm_dp_init_mem(
  * @param dev_name - device node name, e.g. "/dev/csm0-dp1"
  * @param logcfg - pointer to the structure which contains the
  *      	library logging configuration
+ *
  * @return On success, it returns file descriptor of DP device
  *         If it fails, it returns negative value
  */
-int csm_dp_init_ex(const char *dev_name, const struct csm_dp_log_cfg *logcfg)
+int csm_dp_init_ex(const char *dev_name,
+		   const struct csm_dp_log_cfg *logcfg)
 {
 	int fd, ret;
+	char *ptr = NULL, *base = NULL;
+	unsigned int bus_num, vf_num, handle = 0;
+	unsigned int bus_index, vf_index;
 
-	if (csm_dp_is_inited()) {
-		DP_LOG_DEBUG("Lib already initialized!\n");
-		return __libData.fd;
+	if (dev_name == NULL)
+		return -EINVAL;
+
+	base = strstr(dev_name, "csm");
+	if(!base)
+		return -EINVAL;
+
+	bus_num = strtoul(base + 3, &ptr, 0);
+	if (bus_num >= CSM_DP_MAX_BUS)
+		return -EINVAL;
+
+	base = strstr(dev_name, "-dp");
+	if(!base)
+		return -EINVAL;
+
+	vf_num = strtoul(base + 3, &ptr, 0);
+	if (vf_num >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	if (!lib_data_initialized) {
+		memset(&__libData, 0, sizeof(__libData));
+		for (bus_index = 0; bus_index < CSM_DP_MAX_BUS; bus_index++) {
+			for (vf_index = 0; vf_index < CSM_DP_MAX_VF; vf_index++) {
+				__libData[bus_index][vf_index].fd = -1;
+			}
+		}
+		lib_data_initialized = true;
 	}
-	if (logcfg) {
-		if (!csm_dp_log_cfg_is_valid(logcfg))
-			return -EINVAL;
-		memcpy(&__libData.logcfg, logcfg, sizeof(*logcfg));
+
+	handle = CREATE_HANDLE(bus_num, vf_num);
+
+	if (csm_dp_is_inited(handle)) {
+		DP_LOG_DEBUG(handle, "Lib already initialized!\n");
+		return __libData[bus_num][vf_num].fd;
 	}
-	if ((ret = __init_dp_log(&__libData.logcfg)))
-		return ret;
 
 	fd = open(dev_name, O_RDWR);
 	if (fd < 0) {
-		DP_LOG_ERR("Failed to open device file!\n");
+		DP_LOG_ERR(handle, "Failed to open device file!\n");
 		return -ENODEV;
 	}
 
-	pthread_mutex_init(&__libData.mutex, NULL);
-	atexit(csm_dp_cleanup);
-	__libData.fd = fd;
-	__libData.flag |= LIB_FLAG_INITED;
+	if (logcfg) {
+		if (!csm_dp_log_cfg_is_valid(logcfg)) {
+			DP_LOG_ERR(handle, "Invalid log configuration\n");
+			return -EINVAL;
+		}
+		memcpy(&__libData[bus_num][vf_num].logcfg,
+		       logcfg, sizeof(*logcfg));
+	}
+	if ((ret = __init_dp_log(&__libData[bus_num][vf_num].logcfg))) {
+		close(fd);
+		return ret;
+	}
 
-	DP_LOG_DEBUG("%s: dev_name %s fd %d\n", __func__, dev_name, fd);
+	pthread_mutex_init(&__libData[bus_num][vf_num].mutex, NULL);
+	pthread_mutex_init(&__libData[bus_num][vf_num].tx_mutex, NULL);
+	pthread_mutex_init(&__libData[bus_num][vf_num].rx_c_mutex, NULL);
+	pthread_mutex_init(&__libData[bus_num][vf_num].rx_d_mutex, NULL);
+	atexit(csm_dp_cleanup);
+	__libData[bus_num][vf_num].fd = fd;
+	__libData[bus_num][vf_num].flag |= LIB_FLAG_INITED;
+
+	DP_LOG_DEBUG(handle, "%s: dev_name %s fd %d\n", __func__, dev_name, fd);
 
 	return fd;
 }
@@ -1085,6 +1241,57 @@ int csm_dp_init(const struct csm_dp_log_cfg *logcfg)
 
 /**
  * @brief
+ * Cleanup the library using vf. After it returns, the file descriptor is
+ * closed and all the mmaped DP memory areas are unmapped. Any
+ * attempt to access those memory regions will cause page fault.
+ *
+ * @param handle - Handle for a csm_dp instance
+ * @return None
+ */
+void csm_dp_cleanup_vf(uint16_t handle)
+{
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
+	int type;
+
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return;
+
+	if (__libData[bus][vf].fd == -1) {
+		DP_LOG_DEBUG(handle, "%s: invalid fd for bus:%u vf:%u\n",
+				__func__, bus, vf);
+		return;
+	}
+	printf("%s: called for bus:%u vf:%u\n", __func__, bus, vf);
+
+	if (!csm_dp_is_inited(handle))
+		return;
+
+	DP_LOG_DEBUG(handle, "%s: start\n", __func__);
+
+	for (type = 0; type < CSM_DP_RX_TYPE_LAST; type++) {
+		if (__libData[bus][vf].rxhdl[type]) {
+			__free_rx_hdl(__libData[bus][vf].rxhdl[type]);
+			__libData[bus][vf].rxhdl[type] = NULL;
+		}
+	}
+
+	for (type = 0; type < CSM_DP_MEM_TYPE_LAST; type++) {
+		if (__libData[bus][vf].hdl[type]) {
+			__free_mempool_hdl(handle, __libData[bus][vf].hdl[type]);
+			__libData[bus][vf].hdl[type] = NULL;
+		}
+	}
+
+	pthread_mutex_destroy(&__libData[bus][vf].mutex);
+	DP_LOG_DEBUG(handle, "%s: closing fd\n", __func__);
+	close(__libData[bus][vf].fd);
+	__cleanup_dp_log(&__libData[bus][vf].logcfg);
+	__libData[bus][vf].flag &= ~LIB_FLAG_INITED;
+}
+
+/**
+ * @brief
  * Cleanup the library. After it returns, the file descriptor is
  * closed and all the mmaped DP memory areas are unmapped. Any
  * attempt to access those memory regions will cause page fault.
@@ -1093,34 +1300,45 @@ int csm_dp_init(const struct csm_dp_log_cfg *logcfg)
  */
 void csm_dp_cleanup(void)
 {
-	int type;
+	int type, bus, vf;
+	uint16_t handle;
 
-	DP_LOG_DEBUG("%s: start\n", __func__);
+	for (bus = 0; bus < CSM_DP_MAX_BUS; bus++) {
 
-	if (!csm_dp_is_inited())
-		return;
+		for (vf = 0; vf < CSM_DP_MAX_VF; vf++) {
 
-	for (type = 0; type < CSM_DP_RX_TYPE_LAST; type++) {
-		if (__libData.rxhdl[type]) {
-			__free_rx_hdl(__libData.rxhdl[type]);
-			__libData.rxhdl[type] = NULL;
+			if (__libData[bus][vf].fd == -1)
+				continue;
+
+			handle = CREATE_HANDLE(bus, vf);
+
+			if (!csm_dp_is_inited(handle))
+				return;
+
+			DP_LOG_DEBUG(handle, "%s: start\n", __func__);
+
+			for (type = 0; type < CSM_DP_RX_TYPE_LAST; type++) {
+				if (__libData[bus][vf].rxhdl[type]) {
+					__free_rx_hdl(__libData[bus][vf].rxhdl[type]);
+					__libData[bus][vf].rxhdl[type] = NULL;
+				}
+			}
+
+			for (type = 0; type < CSM_DP_MEM_TYPE_LAST; type++) {
+				if (__libData[bus][vf].hdl[type]) {
+					__free_mempool_hdl(handle, __libData[bus][vf].hdl[type]);
+					__libData[bus][vf].hdl[type] = NULL;
+				}
+			}
+
+			pthread_mutex_destroy(&__libData[bus][vf].mutex);
+			DP_LOG_DEBUG(handle, "%s: closing fd\n", __func__);
+			close(__libData[bus][vf].fd);
+			__cleanup_dp_log(&__libData[bus][vf].logcfg);
+			__libData[bus][vf].flag &= ~LIB_FLAG_INITED;
 		}
 	}
-
-	for (type = 0; type < CSM_DP_MEM_TYPE_LAST; type++) {
-		if (__libData.hdl[type]) {
-			__free_mempool_hdl(__libData.hdl[type]);
-			__libData.hdl[type] = NULL;
-		}
-	}
-
-	pthread_mutex_destroy(&__libData.mutex);
-	DP_LOG_DEBUG("%s: closing fd\n", __func__);
-	close(__libData.fd);
-	__cleanup_dp_log(&__libData.logcfg);
-	__libData.flag &= ~LIB_FLAG_INITED;
 }
-
 
 /**
  * @brief
@@ -1144,42 +1362,50 @@ void csm_dp_cleanup(void)
  * @param buf_sz - size of buffer in bytes.
  * @param buf_num - size of DP memory region in number of
  *      	  fixed-size buffer
+ * @param handle - Handle for a csm_dp instance
  *
  * @return On success - 0, otherwise failed
  */
 int csm_dp_init_mem(
+	uint16_t handle,
 	enum csm_dp_mem_type type,
 	unsigned int buf_sz,
 	unsigned int buf_num)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	int ret = 0;
 
-	DP_LOG_DEBUG("%s: type %d buf_sz %d buf_num %d\n", __func__, type, buf_sz, buf_num);
+	DP_LOG_DEBUG(handle, "%s: type %d buf_sz %d buf_num %d\n", __func__, type, buf_sz, buf_num);
 
-	if (!csm_dp_is_inited()) {
-		DP_LOG_ERR("Library is not intialized!\n");
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+
+	if (!csm_dp_is_inited(handle)) {
+		DP_LOG_ERR(handle, "Library is not intialized!\n");
 		return -EAGAIN;
 	}
 
 	if (!csm_dp_mem_type_is_valid(type)) {
-		DP_LOG_ERR("Invalid memory type %d\n", type);
+		DP_LOG_ERR(handle, "Invalid memory type %d\n", type);
 		return -EINVAL;
 	}
 	if (!buf_num) {
-		DP_LOG_ERR("Invalid buffer counter(%u)\n", buf_num);
+		DP_LOG_ERR(handle, "Invalid buffer counter(%u)\n", buf_num);
 		return -EINVAL;
 	}
 	if (!buf_sz || buf_sz > CSM_DP_MAX_DL_MSG_LEN) {
-		DP_LOG_ERR("Buffer size(%u) exceeds limit %d\n",
+		DP_LOG_ERR(handle, "Buffer size(%u) exceeds limit %d\n",
 			buf_sz, CSM_DP_MAX_DL_MSG_LEN);
 		return -EINVAL;
 	}
 
-	pthread_mutex_lock(&__libData.mutex);
-	ret = __csm_dp_init_mem(type, buf_sz, buf_num);
-	pthread_mutex_unlock(&__libData.mutex);
+	pthread_mutex_lock(&__libData[bus][vf].mutex);
+	ret = __csm_dp_init_mem(handle, type, buf_sz, buf_num);
+	pthread_mutex_unlock(&__libData[bus][vf].mutex);
 
-	DP_LOG_DEBUG("%s: end\n", __func__);
+	DP_LOG_DEBUG(handle, "%s: end\n", __func__);
 
 	return ret;
 }
@@ -1192,26 +1418,33 @@ int csm_dp_init_mem(
  * unmapped. On return of this api, any attempt to access this
  * DP memory region will cause page fault.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param type - type of DP memory region to cleanup
  *
  * @return None
  */
-void csm_dp_cleanup_mem(enum csm_dp_mem_type type)
+void csm_dp_cleanup_mem(uint16_t handle, enum csm_dp_mem_type type)
 {
-	DP_LOG_DEBUG("%s: type %d\n", __func__, type);
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 
-	if (csm_dp_is_inited() && csm_dp_mem_type_is_valid(type)) {
-		struct csm_dp_mempool_hdl *hdl = __libData.hdl[type];
+	if (bus >= CSM_DP_MAX_BUS || CSM_DP_MAX_VF)
+		return;
+
+	DP_LOG_DEBUG(handle, "%s: type %d\n", __func__, type);
+
+	if (csm_dp_is_inited(handle) && csm_dp_mem_type_is_valid(type)) {
+		struct csm_dp_mempool_hdl *hdl = __libData[bus][vf].hdl[type];
 
 		if (hdl) {
-			pthread_mutex_lock(&__libData.mutex);
-			__free_mempool_hdl(hdl);
-			__libData.hdl[type] = NULL;
-			pthread_mutex_unlock(&__libData.mutex);
+			pthread_mutex_lock(&__libData[bus][vf].mutex);
+			__free_mempool_hdl(handle, hdl);
+			__libData[bus][vf].hdl[type] = NULL;
+			pthread_mutex_unlock(&__libData[bus][vf].mutex);
 		}
 	}
 
-	DP_LOG_DEBUG("%s: end\n", __func__);
+	DP_LOG_DEBUG(handle, "%s: end\n", __func__);
 }
 
 /**
@@ -1227,77 +1460,87 @@ void csm_dp_cleanup_mem(enum csm_dp_mem_type type)
  * - mmap ring buffer for buffer management into user space
  * - mmap ring buffer for receiving queue into user space
  *
+ * @param handle - Handle for a csm_dp instance
+ *
  * @return On success - 0, otherwise failed
  */
-int csm_dp_init_rx(void)
+int csm_dp_init_rx(uint16_t handle)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	struct csm_dp_rx_hdl *rxhdl;
 	int ret = 0;
 	enum csm_dp_rx_type type = CSM_DP_RX_TYPE_FAPI;
 
-	DP_LOG_DEBUG("%s: start\n", __func__);
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
 
-	if (!csm_dp_is_inited()) {
-		DP_LOG_ERR("Library is not intialized!\n");
+	DP_LOG_DEBUG(handle, "%s: start\n", __func__);
+
+	if (!csm_dp_is_inited(handle)) {
+		DP_LOG_ERR(handle, "Library is not intialized!\n");
 		return -EAGAIN;
 	}
 	if (!csm_dp_rx_type_is_valid(type)) {
-		DP_LOG_ERR("Invalid rx type(%d)\n", type);
+		DP_LOG_ERR(handle, "Invalid rx type(%d)\n", type);
 		return -EINVAL;
 	}
 
-	pthread_mutex_lock(&__libData.mutex);
-	if (__libData.rxhdl[type]) {
-		rxhdl = __libData.rxhdl[type];
+	pthread_mutex_lock(&__libData[bus][vf].mutex);
+	if (__libData[bus][vf].rxhdl[type]) {
+		rxhdl = __libData[bus][vf].rxhdl[type];
 		if (rxhdl->type != type) {
-			DP_LOG_ERR("Can't reintialize RX to different type!\n");
+			DP_LOG_ERR(handle, "Can't reintialize RX to different type!\n");
 			ret = -EBUSY;
 		}
-		pthread_mutex_unlock(&__libData.mutex);
+		pthread_mutex_unlock(&__libData[bus][vf].mutex);
 		return ret;
 	}
 
-	if (__libData.hdl[CSM_DP_MEM_TYPE_UL_CONTROL] == NULL) {
-		ret = __csm_dp_init_mem(CSM_DP_MEM_TYPE_UL_CONTROL,
+	if ((__libData[bus][vf].hdl[CSM_DP_MEM_TYPE_UL_CONTROL] == NULL)) {
+
+		ret = __csm_dp_init_mem(handle,
+					CSM_DP_MEM_TYPE_UL_CONTROL,
 					DEFAULT_UL_BUFSZ,
 					DEFAULT_UL_BUFCNT);
 		if (ret) {
-			DP_LOG_ERR("Failed to initialize UL_CONTROL memory!\n");
-			pthread_mutex_unlock(&__libData.mutex);
+			DP_LOG_ERR(handle, "Failed to initialize UL_CONTROL memory!\n");
+			pthread_mutex_unlock(&__libData[bus][vf].mutex);
 			return ret;
 		}
 	}
 
-	if (__libData.hdl[CSM_DP_MEM_TYPE_UL_DATA] == NULL) {
-		ret = __csm_dp_init_mem(CSM_DP_MEM_TYPE_UL_DATA,
+	if ((__libData[bus][vf].hdl[CSM_DP_MEM_TYPE_UL_DATA] == NULL)) {
+		ret = __csm_dp_init_mem(handle,
+					CSM_DP_MEM_TYPE_UL_DATA,
 					DEFAULT_UL_BUFSZ,
 					DEFAULT_UL_BUFCNT);
 		if (ret) {
-			DP_LOG_ERR("Failed to initialize UL_DATA memory!\n");
-			pthread_mutex_unlock(&__libData.mutex);
+			DP_LOG_ERR(handle, "Failed to initialize UL_DATA memory!\n");
+			pthread_mutex_unlock(&__libData[bus][vf].mutex);
 			return ret;
 		}
 	}
 
-	rxhdl = __create_rx_hdl((enum csm_dp_mmap_type)type);
+	rxhdl = __create_rx_hdl(handle, (enum csm_dp_mmap_type)type);
 	if (rxhdl == NULL) {
-		DP_LOG_ERR("Failed to allocate rx handler\n");
-		pthread_mutex_unlock(&__libData.mutex);
+		DP_LOG_ERR(handle, "Failed to allocate rx handler\n");
+		pthread_mutex_unlock(&__libData[bus][vf].mutex);
 		return -ENOMEM;
 	}
 
-	ret = __init_rx_hdl(rxhdl);
+	ret = __init_rx_hdl(handle, rxhdl);
 	if (ret) {
-		DP_LOG_ERR("Failed to initialize rx handler\n");
+		DP_LOG_ERR(handle, "Failed to initialize rx handler\n");
 		__free_rx_hdl(rxhdl);
-		pthread_mutex_unlock(&__libData.mutex);
+		pthread_mutex_unlock(&__libData[bus][vf].mutex);
 		return ret;
 	}
 
-	__libData.rxhdl[type] = rxhdl;
-	pthread_mutex_unlock(&__libData.mutex);
+	__libData[bus][vf].rxhdl[type] = rxhdl;
+	pthread_mutex_unlock(&__libData[bus][vf].mutex);
 
-	DP_LOG_DEBUG("%s: end\n", __func__);
+	DP_LOG_DEBUG(handle, "%s: end\n", __func__);
 
 	return 0;
 }
@@ -1310,49 +1553,63 @@ int csm_dp_init_rx(void)
  * returns the buffer pointer which points to the starting of
  * message payload
  *
+ * @param dev_handle - Handle for a csm_dp instance
  * @param type - type of DP memory region
  * @param length - length of buffer for message payload
  *
  * @return The buffer pointer or NULL if it fails.
  */
-static void *__csm_dp_ealloc_txbuf(enum csm_dp_mem_type type,
-			unsigned int length, unsigned int *handle)
+static void *__csm_dp_ealloc_txbuf(uint16_t dev_handle,
+				   enum csm_dp_mem_type type,
+				   unsigned int length,
+				   unsigned int *handle)
 {
+	unsigned int bus = csm_dp_get_bus_index(dev_handle);
+	unsigned int vf = csm_dp_get_vf_index(dev_handle);
 	struct csm_dp_mempool_hdl *hdl;
 	char *p = NULL;
 	char *busy_buf = NULL;
 	char *buf = NULL;
 
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return NULL;
+
 	if (!csm_dp_mem_type_is_valid(type)) {
-		DP_LOG_ERR("Cannot allocate buffer, invalid memory type %d!\n", type);
+		DP_LOG_ERR(dev_handle, "Cannot allocate buffer, invalid memory type %d!\n", type);
 		return NULL;
 	}
 
-	hdl = __libData.hdl[type];
+	hdl = __libData[bus][vf].hdl[type];
 	if (hdl && hdl->ops.alloc_buf && hdl->ops.free_buf) {
 		struct csm_dp_mem_hdl *memhdl = &hdl->mem_hdl;
 
 		if (memhdl->bufsz < (length + memhdl->buf_headroom_sz)) {
-			DP_LOG_ERR("buffer length(%u) is out of range (%u)!\n",
+			DP_LOG_ERR(dev_handle, "buffer length(%u) is out of range (%u)!\n",
 					length, memhdl->bufsz - memhdl->buf_headroom_sz);
 			return NULL;
 		}
 again:
-		p = hdl->ops.alloc_buf(hdl);
+		p = hdl->ops.alloc_buf(dev_handle, hdl);
 		if (p) {
 			struct csm_dp_bufobj *bufobj;
 			struct csm_dp_buf_cntrl *pcntrl;
 
 			if (p == busy_buf) {
-				hdl->ops.free_buf(hdl, p);
+				hdl->ops.free_buf(dev_handle, hdl, p);
 				return NULL;
 			}
 			pcntrl = csm_dp_get_buf_overhead(p);
 			if (pcntrl->xmit_status == CSM_DP_XMIT_IN_PROGRESS) {
-				__csm_dp_num_alloc_tx_buf_tx_in_progress++;
+				pthread_mutex_lock(&__libData[bus][vf].tx_mutex);
+				if (type == CSM_DP_MEM_TYPE_DL_CONTROL)
+					__libData[bus][vf].tx_buf_inprogress[CSM_DP_CH_CONTROL]++;
+				else
+					__libData[bus][vf].tx_buf_inprogress[CSM_DP_CH_DATA]++;
+				pthread_mutex_unlock(&__libData[bus][vf].tx_mutex);
+
 				if (!busy_buf)
 					busy_buf = p;
-				hdl->ops.free_buf(hdl, p);
+				hdl->ops.free_buf(dev_handle, hdl, p);
 				goto again;
 			}
 			bufobj = ptr_to_bufobj(memhdl, p);
@@ -1367,14 +1624,18 @@ again:
 	return buf;
 }
 
-void *csm_dp_alloc_txbuf(enum csm_dp_mem_type type, unsigned int length)
+void *csm_dp_alloc_txbuf(uint16_t dev_handle,
+			 enum csm_dp_mem_type type,
+			 unsigned int length)
 {
-	return __csm_dp_ealloc_txbuf(type, length, NULL);
+	return __csm_dp_ealloc_txbuf(dev_handle, type, length, NULL);
 }
-void *csm_dp_ealloc_txbuf(enum csm_dp_mem_type type, unsigned int length,
-			unsigned int *handle)
+void *csm_dp_ealloc_txbuf(uint16_t dev_handle,
+			  enum csm_dp_mem_type type,
+			  unsigned int length,
+			  unsigned int *handle)
 {
-	return __csm_dp_ealloc_txbuf(type, length, handle);
+	return __csm_dp_ealloc_txbuf(dev_handle, type, length, handle);
 }
 
 /**
@@ -1388,37 +1649,39 @@ void *csm_dp_ealloc_txbuf(enum csm_dp_mem_type type, unsigned int length,
  * is returned by csm_dp_ealloc_txbuf(), it will be associated with
  * a different handle.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param bufptr - buffer pointer. It must be returned by a
  *      	 previous call to csm_dp_alloc_tx()
  *
  * @return None
  */
-static inline void __csm_dp_free_txbuf(struct csm_dp_mempool_hdl *hdl,
-					void *bufptr)
+static inline void __csm_dp_free_txbuf(uint16_t handle,
+				       struct csm_dp_mempool_hdl *hdl,
+				       void *bufptr)
 {
 
-	__mempool_put_buf(hdl, bufptr);
+	__mempool_put_buf(handle, hdl, bufptr);
 }
 
-static void csm_dp_free_txbuf(void *bufptr)
+static void csm_dp_free_txbuf(uint16_t handle, void *bufptr)
 {
 	struct csm_dp_mempool_hdl *hdl;
 
 	if (!bufptr) {
-		DP_LOG_WARN("Cannot free buffer with Null pointer\n");
+		DP_LOG_WARN(handle, "Cannot free buffer with Null pointer\n");
 		return;
 	}
-	hdl = __find_mempool(bufptr);
+	hdl = __find_mempool(handle, bufptr);
 	if (!hdl) {
-		DP_LOG_WARN("Cannot find mempool\n");
+		DP_LOG_WARN(handle, "Cannot find mempool\n");
 		return;
 	}
-	__csm_dp_free_txbuf(hdl, bufptr);
+	__csm_dp_free_txbuf(handle, hdl, bufptr);
 }
 
-void csm_dp_free_unsent_txbuf(void *bufptr)
+void csm_dp_free_unsent_txbuf(uint16_t handle, void *bufptr)
 {
-	csm_dp_free_txbuf(bufptr);
+	csm_dp_free_txbuf(handle, bufptr);
 }
 
 /**
@@ -1440,6 +1703,7 @@ void csm_dp_free_unsent_txbuf(void *bufptr)
  *
  * The library takes care of freeing the Tx buffers.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param ch - channel to send on (CONTROL or DATA)
  * @param iov - pointer to any array of iovec structure
  * @param iovcnt - number of iovec structure in array
@@ -1448,56 +1712,70 @@ void csm_dp_free_unsent_txbuf(void *bufptr)
  *
  * @return Number of messages which were sent, or negative value
  */
-int csm_dp_send(enum csm_dp_channel ch, struct iovec *iov, unsigned int iovcnt, unsigned int flag)
+int csm_dp_send(uint16_t handle,
+		enum csm_dp_channel ch,
+		struct iovec *iov,
+		unsigned int iovcnt,
+		unsigned int flag)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	struct csm_dp_ioctl_tx req = {0};
 	int ret;
 	unsigned int n, event_id;
 
-	if (!csm_dp_is_inited()) {
-		DP_LOG_ERR("Library is not intialized!\n");
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	if (!csm_dp_is_inited(handle)) {
+		DP_LOG_ERR(handle, "Library is not intialized!\n");
 		return -EAGAIN;
 	}
 	if (!iov) {
-		DP_LOG_ERR("NULL pointer!\n");
+		DP_LOG_ERR(handle, "NULL pointer!\n");
 		return -EINVAL;
 	}
 	if (iovcnt > CSM_DP_MAX_IOV_SIZE || !iovcnt) {
-		DP_LOG_DEBUG("Invalid iov counter %u\n", iovcnt);
+		DP_LOG_DEBUG(handle, "Invalid iov counter %u\n", iovcnt);
 		return -EINVAL;
 	}
 
+	pthread_mutex_lock(&__libData[bus][vf].tx_mutex);
 	req.ch = ch;
 	req.iov.iov_base = iov;
 	req.iov.iov_len = iovcnt;
 	if (flag & CSM_DP_TX_FLAG_MIRROR) {
 		req.flags |= CSM_DP_IOCTL_TX_FLAG_MIRROR;
 	}
-	ret = ioctl(__libData.fd,
+	ret = ioctl(__libData[bus][vf].fd,
 		    (flag & CSM_DP_TX_FLAG_SG) ? CSM_DP_IOCTL_SG_TX : CSM_DP_IOCTL_TX,
 		    &req);
 	if (ret < 0) {
-		DP_LOG_DEBUG("Failed to send messages\n");
+		DP_LOG_DEBUG(handle, "Failed to send messages\n");
 	} else {
 		event_id = (flag & CSM_DP_TX_FLAG_SG) ? DP_CAP_EVENT_DL_SG_MSG : DP_CAP_EVENT_DL_MSGS;
-		__csm_dp_rtx_hook(iov, ret, event_id, ch);
+		__csm_dp_rtx_hook(handle, iov, ret, event_id, ch);
 	}
 
 	if (!(flag & CSM_DP_TX_FLAG_DONT_FREE))
 	{
 		for (n = 0; n < iovcnt; n++)
-			csm_dp_free_txbuf(iov[n].iov_base);
+			csm_dp_free_txbuf(handle, iov[n].iov_base);
 	}
 
+	pthread_mutex_unlock(&__libData[bus][vf].tx_mutex);
 	return ret;
 }
 
 
 static int __csm_dp_recv(
+	uint16_t handle,
 	struct csm_dp_rx_hdl *rxhdl,
 	struct iovec *iov,
 	unsigned int iovcnt)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	struct csm_dp_mem_hdl *memhdl;
 	struct csm_dp_mempool_hdl *hdl;
 	csm_dp_ring_element_data_t val;
@@ -1505,19 +1783,22 @@ static int __csm_dp_recv(
 	int ret;
 	struct csm_dp_buf_cntrl *p;
 
-	hdl = __libData.hdl[CSM_DP_MEM_TYPE_UL_CONTROL];
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	hdl = __libData[bus][vf].hdl[CSM_DP_MEM_TYPE_UL_CONTROL];
 	memhdl = &hdl->mem_hdl;
 
 	while (n < iovcnt) {
 		char *addr;
 
-		ret = __ring_get_element(&rxhdl->ring_hdl, &val);
+		ret = __ring_get_element(handle, &rxhdl->ring_hdl, &val);
 		if (ret)
 			break;
 
 		if (!is_offset_in_range(val, 0, memhdl->size) ||
 		    !is_offset_in_range(val + memhdl->bufsz - 1, 0, memhdl->size)) {
-			DP_LOG_ERR("Read invalid offset from ring, offset=0x%lx, memsize=0x%lx\n",
+			DP_LOG_ERR(handle, "Read invalid offset from ring, offset=0x%lx, memsize=0x%lx\n",
 				val, memhdl->size);
 			continue;
 		}
@@ -1542,7 +1823,7 @@ static int __csm_dp_recv(
 #ifdef CSM_DP_BUFFER_FENCING
 			if (p->fence != CSM_DP_BUFFER_FENCE_SIG ||
 					p->signature != CSM_DP_BUFFER_SIG) {
-				DP_LOG_ERR(
+				DP_LOG_ERR(handle,
 					"%s: mem handle %p buffer corrupted,"
 					" offset 0x%lx, fence 0x%x, expect 0x%x,"
 					" signature 0x%x, expect 0x%x,"
@@ -1563,7 +1844,7 @@ static int __csm_dp_recv(
 			if (p->next_buf_index == CSM_DP_INVALID_BUF_INDEX) {
 				unsigned int event_id = (packet_iovcnt > 1) ? DP_CAP_EVENT_UL_SG_MSG : DP_CAP_EVENT_UL_MSGS;
 
-				__csm_dp_rtx_hook(&iov[packet_start], packet_iovcnt, event_id, CSM_DP_CH_CONTROL);
+				__csm_dp_rtx_hook(handle, &iov[packet_start], packet_iovcnt, event_id, CSM_DP_CH_CONTROL);
 				packet_start = n;
 				packet_iovcnt = 0;
 				break;
@@ -1587,6 +1868,7 @@ static int __csm_dp_recv(
  * It is a non-blocking API. For blocking receive, user should
  * do select before calling ths API.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param iov - pointer to any array of iovec structure
  * @param iovcnt - number of iovec structure in array
  *
@@ -1596,30 +1878,37 @@ static int __csm_dp_recv(
  * On success, the iov structure will be updated with the
  * message pointer and message length information
  */
-int csm_dp_recv(struct iovec *iov, unsigned int iovcnt)
+int csm_dp_recv(uint16_t handle, struct iovec *iov, unsigned int iovcnt)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	int n = 0, i, f;
+
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
 
 	if (!iov || !iovcnt || iovcnt > CSM_DP_MAX_IOV_SIZE)
 		return -EINVAL;
 
-	if (!csm_dp_is_inited()) {
-		DP_LOG_ERR("Library is not intialized!\n");
+	if (!csm_dp_is_inited(handle)) {
+		DP_LOG_ERR(handle, "Library is not intialized!\n");
 		return -EPERM;
 	}
 
+	pthread_mutex_lock(&__libData[bus][vf].rx_c_mutex);
 	for (i = 0, f = 1; i < CSM_DP_RX_TYPE_LAST; i++, f <<= 1) {
 		int ret;
 
-		if (!__libData.rxhdl[i])
+		if (!__libData[bus][vf].rxhdl[i])
 			continue;
-		ret = __csm_dp_recv(__libData.rxhdl[i], &iov[n], iovcnt - n);
+		ret = __csm_dp_recv(handle, __libData[bus][vf].rxhdl[i], &iov[n], iovcnt - n);
 		if (ret < 0)
 			break;
 		n += ret;
 		if (n == (int)iovcnt)
 			break;
 	}
+	pthread_mutex_unlock(&__libData[bus][vf].rx_c_mutex);
 	return n;
 }
 
@@ -1631,6 +1920,7 @@ int csm_dp_recv(struct iovec *iov, unsigned int iovcnt)
  * call csm_dp_rx_poll to fetch received UL packets. Failing to poll at the
  * appropriate rate will result in out of Rx buffers.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param iov - pointer to any array of iovec structure
  * @param iovcnt - number of iovec structure in array
  *
@@ -1639,27 +1929,35 @@ int csm_dp_recv(struct iovec *iov, unsigned int iovcnt)
  * On success, the iov structure will be updated with the
  * message pointer and message length information
  */
-int csm_dp_rx_poll(struct iovec *iov, unsigned int iovcnt)
+int csm_dp_rx_poll(uint16_t handle, struct iovec *iov, unsigned int iovcnt)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	struct iovec req;
 	int ret, i;
 	struct csm_dp_mem_hdl *memhdl;
 	struct csm_dp_mempool_hdl *hdl;
 	unsigned int packet_start = 0, packet_iovcnt = 0;
 
-	hdl = __libData.hdl[CSM_DP_MEM_TYPE_UL_DATA];
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	pthread_mutex_lock(&__libData[bus][vf].rx_d_mutex);
+	hdl = __libData[bus][vf].hdl[CSM_DP_MEM_TYPE_UL_DATA];
 	memhdl = &hdl->mem_hdl;
 
-	if (!csm_dp_is_inited()) {
-		DP_LOG_ERR("Library is not intialized!\n");
+	if (!csm_dp_is_inited(handle)) {
+		DP_LOG_ERR(handle, "Library is not intialized!\n");
+		pthread_mutex_unlock(&__libData[bus][vf].rx_d_mutex);
 		return -EPERM;
 	}
 
 	req.iov_base = iov;
 	req.iov_len = iovcnt;
-	ret = ioctl(__libData.fd, CSM_DP_IOCTL_RX_POLL, &req);
+	ret = ioctl(__libData[bus][vf].fd, CSM_DP_IOCTL_RX_POLL, &req);
 	if (ret < 0) {
-		DP_LOG_ERR("CSM_DP_IOCTL_RX_POLL failed %d\n", ret);
+		DP_LOG_ERR(handle, "CSM_DP_IOCTL_RX_POLL failed %d\n", ret);
+		pthread_mutex_unlock(&__libData[bus][vf].rx_d_mutex);
 		return ret;
 	}
 
@@ -1670,7 +1968,8 @@ int csm_dp_rx_poll(struct iovec *iov, unsigned int iovcnt)
 
 		if (!is_offset_in_range(offset, 0, memhdl->size) ||
 		    !is_offset_in_range(offset + memhdl->bufsz - 1, 0, memhdl->size)) {
-			DP_LOG_ERR("Got invalid offset from rx_poll, offset=0x%lx, memsize=0x%lx\n", offset, memhdl->size);
+			DP_LOG_ERR(handle, "Got invalid offset from rx_poll, offset=0x%lx, memsize=0x%lx\n", offset, memhdl->size);
+			pthread_mutex_unlock(&__libData[bus][vf].rx_d_mutex);
 			return -EINVAL;
 		}
 
@@ -1687,12 +1986,12 @@ int csm_dp_rx_poll(struct iovec *iov, unsigned int iovcnt)
 
 		if (iov[i].iov_len > 0) {
 			event_id = (packet_iovcnt > 1) ? DP_CAP_EVENT_UL_SG_MSG : DP_CAP_EVENT_UL_MSGS;
-			__csm_dp_rtx_hook(&iov[packet_start], packet_iovcnt, event_id, CSM_DP_CH_DATA);
+			__csm_dp_rtx_hook(handle, &iov[packet_start], packet_iovcnt, event_id, CSM_DP_CH_DATA);
 			packet_start = i + 1;
 			packet_iovcnt = 0;
 		}
 	}
-
+	pthread_mutex_unlock(&__libData[bus][vf].rx_d_mutex);
 	return ret;
 }
 
@@ -1703,17 +2002,24 @@ int csm_dp_rx_poll(struct iovec *iov, unsigned int iovcnt)
  * After UL message is processed, the user application must use
  * this API to free the RX buffer.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param bufptr - buffer pointer. It must have been returned in
  *      	 iov_base field of iovec structure by
  *      	 csm_dp_receive or csm_dp_receive_lbrsp API.
  * @return None
  */
-void csm_dp_free_rxbuf(void *bufptr)
+void csm_dp_free_rxbuf(uint16_t handle, void *bufptr)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
+
 	struct csm_dp_buf_cntrl *buf_cntrl;
 	enum csm_dp_mem_type mem_type;
 
-	if (!csm_dp_is_inited())
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return;
+
+	if (!csm_dp_is_inited(handle))
 		return;
 
 	buf_cntrl = csm_dp_get_buf_overhead(bufptr);
@@ -1723,7 +2029,7 @@ void csm_dp_free_rxbuf(void *bufptr)
 		// invalid mem_type
 		return;
 
-	__mempool_put_buf(__libData.hdl[mem_type], bufptr);
+	__mempool_put_buf(handle, __libData[bus][vf].hdl[mem_type], bufptr);
 }
 
 /**
@@ -1733,14 +2039,15 @@ void csm_dp_free_rxbuf(void *bufptr)
  * In API to free the buffer, it decreases the reference counter and
  * free the buffer if the counter reaches zero.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param bufptr - buffer pointer.
  *
  * @return None
  */
-static void csm_dp_hold_buf(void *bufptr)
+static void csm_dp_hold_buf(uint16_t handle, void *bufptr)
 {
-	if (csm_dp_is_inited()) {
-		struct csm_dp_mempool_hdl *hdl = __find_mempool(bufptr);
+	if (csm_dp_is_inited(handle)) {
+		struct csm_dp_mempool_hdl *hdl = __find_mempool(handle, bufptr);
 
 		if (hdl)
 			__mempool_hold_buf(hdl, bufptr);
@@ -1756,6 +2063,7 @@ static void csm_dp_hold_buf(void *bufptr)
  * thread for each packet received/transmitted using library
  * API.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param callback_ops - callback function. Set to NULL to use
  *      	   default callback in library which writes
  *      	   message into file.
@@ -1769,48 +2077,54 @@ static void csm_dp_hold_buf(void *bufptr)
  *
  */
 int csm_dp_init_capture(
+	uint16_t handle,
 	const struct csm_dp_cap_cb_ops *callback_ops,
 	void *cb_cookie,
 	unsigned int max_event)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	struct csm_dp_cap_hdl *caphdl;
 	int ret;
 
-	if (!csm_dp_is_inited()) {
-		DP_LOG_ERR("Library is not intialized!\n");
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	if (!csm_dp_is_inited(handle)) {
+		DP_LOG_ERR(handle, "Library is not intialized!\n");
 		return -EPERM;
 	}
 
 	if (!(csm_dp_capture_max_event_is_valid(max_event))) {
-		DP_LOG_ERR("Input parameter: max_event is not valid!\n");
+		DP_LOG_ERR(handle, "Input parameter: max_event is not valid!\n");
 		return -EINVAL;
 	}
 
-	pthread_mutex_lock(&__libData.mutex);
-	if (__libData.caphdl) {
-		DP_LOG_ERR("Capture thread already started!\n");
-		pthread_mutex_unlock(&__libData.mutex);
-		return -EAGAIN;
+	pthread_mutex_lock(&__libData[bus][vf].mutex);
+	if (__libData[bus][vf].caphdl) {
+		DP_LOG_ERR(handle, "Capture thread already started!\n");
+		pthread_mutex_unlock(&__libData[bus][vf].mutex);
+		return 0;
 	}
 
 	caphdl = calloc(1, sizeof(*caphdl));
 	if (!caphdl) {
-		DP_LOG_ERR("Failed to allocate memory!\n");
-		pthread_mutex_unlock(&__libData.mutex);
+		DP_LOG_ERR(handle, "Failed to allocate memory!\n");
+		pthread_mutex_unlock(&__libData[bus][vf].mutex);
 		return -ENOMEM;
 	}
 
-	ret = __init_cap_hdl(caphdl, callback_ops, cb_cookie, max_event);
+	ret = __init_cap_hdl(handle, caphdl, callback_ops, cb_cookie, max_event);
 	if (ret) {
-		DP_LOG_ERR("Failed to intialize capture handler\n");
-		pthread_mutex_unlock(&__libData.mutex);
+		DP_LOG_ERR(handle, "Failed to intialize capture handler\n");
+		pthread_mutex_unlock(&__libData[bus][vf].mutex);
 		__cleanup_cap_hdl(caphdl);
 		return ret;
 
 	}
 
-	__libData.caphdl = caphdl;
-	pthread_mutex_unlock(&__libData.mutex);
+	__libData[bus][vf].caphdl = caphdl;
+	pthread_mutex_unlock(&__libData[bus][vf].mutex);
 	return 0;
 }
 
@@ -1818,31 +2132,37 @@ int csm_dp_init_capture(
  * @brief
  * To stop traffic capture and streaming.
  *
- * @param none
+ * @param handle - Handle for a csm_dp instance
  *
  * @return None
  */
-void csm_dp_cleanup_capture(void)
+void csm_dp_cleanup_capture(uint16_t handle)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	struct csm_dp_cap_hdl *caphdl;
 
-	if (!csm_dp_is_inited())
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
 		return;
 
-	pthread_mutex_lock(&__libData.mutex);
-	caphdl = __libData.caphdl;
-	__libData.caphdl = NULL;
-	pthread_mutex_unlock(&__libData.mutex);
+	printf("%s running\n", __func__);
+	if (!csm_dp_is_inited(handle))
+		return;
+
+	pthread_mutex_lock(&__libData[bus][vf].mutex);
+	caphdl = __libData[bus][vf].caphdl;
+	__libData[bus][vf].caphdl = NULL;
+	pthread_mutex_unlock(&__libData[bus][vf].mutex);
 
 	if (caphdl) {
 		struct csm_dp_cap_event_hdl *event_hdl = &caphdl->event_hdl;
 		struct csm_dp_cap_event *event;
 
-		while (!(event=__ring_get_cap_event(&event_hdl->free_ring)))
+		while (!(event=__ring_get_cap_event(handle, &event_hdl->free_ring)))
 			sched_yield();
 
 		event->id = DP_CAP_EVENT_STOP;
-		__ring_put_cap_event(&event_hdl->event_ring, event);
+		__ring_put_cap_event(handle, &event_hdl->event_ring, event);
 		sem_post(&caphdl->sem);
 		pthread_join(caphdl->pid, NULL);
 		__cleanup_cap_hdl(caphdl);
@@ -1854,25 +2174,32 @@ void csm_dp_cleanup_capture(void)
  * To enable traffic capture on a specific channel
  *
  * @param ch - channel for capture
+ * @param handle - Handle for a csm_dp instance
  *
  * @return On success - 0, otherwise failed
  */
-int csm_dp_enable_capture(enum csm_dp_channel ch)
+int csm_dp_enable_capture(uint16_t handle,
+			  enum csm_dp_channel ch)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	int ret = 0;
 
-	if (!csm_dp_is_inited())
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	if (!csm_dp_is_inited(handle))
 		return -EAGAIN;
 
 	if (ch != CSM_DP_CH_CONTROL && ch != CSM_DP_CH_DATA)
 		return -EINVAL;
 
-	pthread_mutex_lock(&__libData.mutex);
-	if (__libData.caphdl)
-		__libData.caphdl->enable[ch] = true;
+	pthread_mutex_lock(&__libData[bus][vf].mutex);
+	if (__libData[bus][vf].caphdl)
+		__libData[bus][vf].caphdl->enable[ch] = true;
 	else
 		ret = -EAGAIN;
-	pthread_mutex_unlock(&__libData.mutex);
+	pthread_mutex_unlock(&__libData[bus][vf].mutex);
 
 	return ret;
 }
@@ -1881,26 +2208,32 @@ int csm_dp_enable_capture(enum csm_dp_channel ch)
  * @brief
  * To disable traffic capture on a specific channel
  *
+ * @param handle - Handle for a csm_dp instance
  * @param ch - channel for capture
  *
  * @return On success - 0, otherwise failed
  */
-int csm_dp_disable_capture(enum csm_dp_channel ch)
+int csm_dp_disable_capture(uint16_t handle, enum csm_dp_channel ch)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	int ret = 0;
 
-	if (!csm_dp_is_inited())
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	if (!csm_dp_is_inited(handle))
 		return -EAGAIN;
 
 	if (ch != CSM_DP_CH_CONTROL && ch != CSM_DP_CH_DATA)
 		return -EINVAL;
 
-	pthread_mutex_lock(&__libData.mutex);
-	if (__libData.caphdl)
-		__libData.caphdl->enable[ch] = false;
+	pthread_mutex_lock(&__libData[bus][vf].mutex);
+	if (__libData[bus][vf].caphdl)
+		__libData[bus][vf].caphdl->enable[ch] = false;
 	else
 		ret = -EAGAIN;
-	pthread_mutex_unlock(&__libData.mutex);
+	pthread_mutex_unlock(&__libData[bus][vf].mutex);
 
 	return ret;
 }
@@ -1910,23 +2243,29 @@ int csm_dp_disable_capture(enum csm_dp_channel ch)
  * To get thread id of the thread created by csm_dp_init_capture
  * API
  *
+ * @param handle - Handle for a csm_dp instance
  * @param tid - pointer to store the thread id
  *
  * @return On success - 0, otherwise failed
  */
-int csm_dp_get_capture_thread_tid(pthread_t *tid)
+int csm_dp_get_capture_thread_tid(uint16_t handle, pthread_t *tid)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	int ret = 0;
 
-	if (!csm_dp_is_inited())
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	if (!csm_dp_is_inited(handle))
 		return -EAGAIN;
 
-	pthread_mutex_lock(&__libData.mutex);
-	if (!__libData.caphdl)
+	pthread_mutex_lock(&__libData[bus][vf].mutex);
+	if (!__libData[bus][vf].caphdl)
 		ret = -EAGAIN;
 	else if (tid)
-		*tid = __libData.caphdl->pid;
-	pthread_mutex_unlock(&__libData.mutex);
+		*tid = __libData[bus][vf].caphdl->pid;
+	pthread_mutex_unlock(&__libData[bus][vf].mutex);
 
 	return ret;
 }
@@ -1936,15 +2275,22 @@ int csm_dp_get_capture_thread_tid(pthread_t *tid)
  * Set the loglevel. The value of log level is defined in
  * syslog.h.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param loglevel - log level.
  *
  * @return On success - 0, otherwise failed
  */
-int csm_dp_set_loglevel(int loglevel)
+int csm_dp_set_loglevel(uint16_t handle, int loglevel)
 {
-	struct csm_dp_log_cfg *cfg = &__libData.logcfg;
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 
-	if (unlikely(!csm_dp_is_inited()))
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	struct csm_dp_log_cfg *cfg = &__libData[bus][vf].logcfg;
+
+	if (unlikely(!csm_dp_is_inited(handle)))
 		return -EAGAIN;
 	if (!csm_dp_log_level_is_valid(loglevel))
 		return -EINVAL;
@@ -1957,22 +2303,30 @@ int csm_dp_set_loglevel(int loglevel)
 
 /* Hook to RX/TX API */
 static int __csm_dp_rtx_hook(
+	uint16_t handle,
 	struct iovec *iov,
 	unsigned int iovcnt,
 	unsigned int event_id,
 	enum csm_dp_channel ch)
 {
-	struct csm_dp_cap_hdl *caphdl = __libData.caphdl;
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	struct csm_dp_cap_event *event = NULL;
 	unsigned int n, sg_len = 0;
+
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	struct csm_dp_cap_hdl *caphdl = __libData[bus][vf].caphdl;
 
 	if (!caphdl || caphdl->state == DP_CAP_STATE_TERM)
 		return 0;
 
-	if (!caphdl->enable[ch])
+	if (!caphdl->enable[ch]) {
 		return 0;
+	}
 
-	event = __ring_get_cap_event(&caphdl->event_hdl.free_ring);
+	event = __ring_get_cap_event(handle, &caphdl->event_hdl.free_ring);
 	if (!event)
 		return -EBUSY;
 
@@ -1995,9 +2349,9 @@ static int __csm_dp_rtx_hook(
 			}
 		}
 
-		csm_dp_hold_buf(iov[n].iov_base);
+		csm_dp_hold_buf(handle, iov[n].iov_base);
 	}
-	__ring_put_cap_event(&caphdl->event_hdl.event_ring, event);
+	__ring_put_cap_event(handle, &caphdl->event_hdl.event_ring, event);
 
 	if (caphdl->state == DP_CAP_STATE_WAIT)
 		sem_post(&caphdl->sem);
@@ -2022,6 +2376,7 @@ static const struct pcap_file_header __pcap_file_hdr = {
 
 /* returns whether new file created or not */
 static bool __default_dp_cap_fopen(
+	uint16_t handle,
 	struct dp_cap_default_cbdata *cb_data,
 	size_t size_to_write)
 {
@@ -2048,7 +2403,7 @@ static bool __default_dp_cap_fopen(
 		}
 		fp = fopen(name, "w+");
 		if (!fp) {
-			DP_LOG_ERR("Failed to open file\n");
+			DP_LOG_ERR(handle, "Failed to open file\n");
 			return false;
 		}
 
@@ -2069,6 +2424,7 @@ static bool __default_dp_cap_fopen(
 }
 
 static int __default_dp_cap_msg_cb(
+	uint16_t handle,
 	void *cookie,
 	const struct timespec *timestamp,
 	const char *buf,
@@ -2082,7 +2438,7 @@ static int __default_dp_cap_msg_cb(
 	size_t size = DP_PCAP_HDR_SIZE + payload_size;
 	size_t n = 0;
 
-	if (__default_dp_cap_fopen(cb_data, size)) {
+	if (__default_dp_cap_fopen(handle, cb_data, size)) {
 		/* new file created - add file hdr */
 		size += sizeof(__pcap_file_hdr);
 		n = fwrite(&__pcap_file_hdr, 1, sizeof(__pcap_file_hdr), cb_data->fp);
@@ -2101,7 +2457,7 @@ static int __default_dp_cap_msg_cb(
 	n += fwrite(&hdr, 1, sizeof(hdr), cb_data->fp);
 	n += fwrite(buf, 1, payload_size, cb_data->fp);
 	if (n != size) {
-		DP_LOG_ERR("Failed to write msg capture into file\n");
+		DP_LOG_ERR(handle, "Failed to write msg capture into file\n");
 		return -EIO;
 	}
 	cb_data->bytes += n;
@@ -2112,6 +2468,7 @@ static int __default_dp_cap_msg_cb(
 }
 
 static int __default_dp_cap_sg_msg_cb(
+	uint16_t handle,
 	void *cookie,
 	const struct iovec *iovec,
 	unsigned int iovcnt,
@@ -2128,7 +2485,7 @@ static int __default_dp_cap_sg_msg_cb(
 
 	payload_size = (cb_data->cfg.snap_len > total_len) ? total_len : cb_data->cfg.snap_len;
 	size = DP_PCAP_HDR_SIZE + payload_size;
-	if (__default_dp_cap_fopen(cb_data, size)) {
+	if (__default_dp_cap_fopen(handle, cb_data, size)) {
 		/* new file created - add file hdr */
 		size += sizeof(__pcap_file_hdr);
 		n = fwrite(&__pcap_file_hdr, 1, sizeof(__pcap_file_hdr), cb_data->fp);
@@ -2156,7 +2513,7 @@ static int __default_dp_cap_sg_msg_cb(
 		payload_size -= segsize;
 	}
 	if (n != size) {
-		DP_LOG_ERR("Failed to write msg capture into file\n");
+		DP_LOG_ERR(handle, "Failed to write msg capture into file\n");
 		return -EIO;
 	}
 	cb_data->bytes += n;
@@ -2172,7 +2529,9 @@ static const struct csm_dp_cap_cb_ops __default_dp_cap_cb_ops = {
 };
 
 /* Setup capture handler as default */
-static int __config_cap_hdl_default(struct csm_dp_cap_hdl *caphdl, const struct csm_dp_cap_defcfg *cfg)
+static int __config_cap_hdl_default(uint16_t handle,
+				    struct csm_dp_cap_hdl *caphdl,
+				    const struct csm_dp_cap_defcfg *cfg)
 {
 	const struct csm_dp_cap_defcfg *conf = (cfg) ? cfg : &__default_cap_cfg;
 	struct dp_cap_default_cbdata *cb_data;
@@ -2182,7 +2541,7 @@ static int __config_cap_hdl_default(struct csm_dp_cap_hdl *caphdl, const struct 
 
 	cb_data = calloc(1, sizeof(*cb_data));
 	if (!cb_data) {
-		DP_LOG_ERR("Failed to allocate memory for cb data\n");
+		DP_LOG_ERR(handle, "Failed to allocate memory for cb data\n");
 		return -ENOMEM;
 	}
 	memcpy(&cb_data->cfg, conf, sizeof(cb_data->cfg));
@@ -2193,6 +2552,7 @@ static int __config_cap_hdl_default(struct csm_dp_cap_hdl *caphdl, const struct 
 }
 
 static int __proc_cap_event(
+	uint16_t handle,
 	struct csm_dp_cap_hdl *hdl,
 	struct csm_dp_cap_event *event)
 {
@@ -2207,11 +2567,12 @@ static int __proc_cap_event(
 			for (i = 0; i < event->msgs.iovec_cnt; i++) {
 				if (!event->msgs.iovec[i].iov_base ||
 				    !event->msgs.iovec[i].iov_len) {
-					DP_LOG_ERR("Invalid message iovec!\n");
+					DP_LOG_ERR(handle, "Invalid message iovec!\n");
 					continue;
 				}
 
-				ret = hdl->ops.msg_cb(hdl->priv_data,
+				ret = hdl->ops.msg_cb(handle,
+					hdl->priv_data,
 					&event->msgs.timestamp,
 					event->msgs.iovec[i].iov_base,
 					event->msgs.iovec[i].iov_len,
@@ -2223,9 +2584,9 @@ static int __proc_cap_event(
 		}
 		for (i = 0; i < event->msgs.iovec_cnt; i++) {
 			if (event->id == DP_CAP_EVENT_DL_MSGS)
-				csm_dp_free_txbuf(event->msgs.iovec[i].iov_base);
+				csm_dp_free_txbuf(handle, event->msgs.iovec[i].iov_base);
 			else
-				csm_dp_free_rxbuf(event->msgs.iovec[i].iov_base);
+				csm_dp_free_rxbuf(handle, event->msgs.iovec[i].iov_base);
 		}
 		break;
 	case DP_CAP_EVENT_DL_SG_MSG:
@@ -2234,14 +2595,15 @@ static int __proc_cap_event(
 			for (i = 0, len = 0; i < event->msgs.iovec_cnt; i++) {
 				if (!event->msgs.iovec[i].iov_base ||
 				    !event->msgs.iovec[i].iov_len) {
-					DP_LOG_ERR("Invalid scatter-gather list!\n");
+					DP_LOG_ERR(handle, "Invalid scatter-gather list!\n");
 					len = 0;
 					break;
 				}
 				len += event->msgs.iovec[i].iov_len;
 			}
 			if (len)
-				ret = hdl->ops.sg_cb(hdl->priv_data,
+				ret = hdl->ops.sg_cb(handle,
+					hdl->priv_data,
 					event->msgs.iovec,
 					event->msgs.iovec_cnt,
 					&event->msgs.timestamp,
@@ -2251,16 +2613,16 @@ static int __proc_cap_event(
 		}
 		for (i = 0; i < event->msgs.iovec_cnt; i++) {
 			if (event->id == DP_CAP_EVENT_DL_SG_MSG)
-				csm_dp_free_txbuf(event->msgs.iovec[i].iov_base);
+				csm_dp_free_txbuf(handle, event->msgs.iovec[i].iov_base);
 			else
-				csm_dp_free_rxbuf(event->msgs.iovec[i].iov_base);
+				csm_dp_free_rxbuf(handle, event->msgs.iovec[i].iov_base);
 		}
 		break;
 	case DP_CAP_EVENT_STOP:
 		hdl->state = DP_CAP_STATE_TERM;
 		break;
 	default:
-		DP_LOG_ERR("Unknown event\n");
+		DP_LOG_ERR(handle, "Unknown event\n");
 		break;
 	}
 	return ret;
@@ -2269,6 +2631,8 @@ static int __proc_cap_event(
 static void *__capture_thread_main(void *arg)
 {
 	struct csm_dp_cap_hdl *caphdl = arg;
+	uint16_t handle = caphdl->handle;
+
 	struct csm_dp_cap_event_hdl *event_hdl = &caphdl->event_hdl;
 	struct csm_dp_cap_event *event;
 	bool done = false;
@@ -2276,13 +2640,13 @@ static void *__capture_thread_main(void *arg)
 
 	caphdl->state = DP_CAP_STATE_RUN;
 	while (!done) {
-		while ((event = __ring_get_cap_event(&event_hdl->event_ring))) {
-			ret = __proc_cap_event(caphdl, event);
+		while ((event = __ring_get_cap_event(handle, &event_hdl->event_ring))) {
+			ret = __proc_cap_event(handle, caphdl, event);
 			if (ret < 0 || caphdl->state == DP_CAP_STATE_TERM) {
 				done = true;
 				break;
 			}
-			__ring_put_cap_event(&event_hdl->free_ring, event);
+			__ring_put_cap_event(handle, &event_hdl->free_ring, event);
 		}
 		if (!done) {
 			caphdl->state = DP_CAP_STATE_WAIT;
@@ -2290,13 +2654,15 @@ static void *__capture_thread_main(void *arg)
 			caphdl->state = DP_CAP_STATE_RUN;
 		}
 	}
-
 	return NULL;
 }
 
 #ifdef CSM_DP_BUFFER_FENCING
 csm_dp_txbuf_status_e
-csm_dp_query_txbuf_status(unsigned int handle, void *bufptr, int *err)
+csm_dp_query_txbuf_status(uint16_t dev_handle,
+			  unsigned int handle,
+			  void *bufptr,
+			  int *err)
 {
 	struct csm_dp_mempool_hdl *hdl;
 	struct csm_dp_bufobj *bufobj;
@@ -2307,9 +2673,9 @@ csm_dp_query_txbuf_status(unsigned int handle, void *bufptr, int *err)
 
 	if (bufptr == NULL)
 		return ret;
-	hdl = __find_mempool(bufptr);
+	hdl = __find_mempool(dev_handle, bufptr);
 	if (!hdl) {
-		DP_LOG_WARN("Cannot find mempool\n");
+		DP_LOG_WARN(dev_handle, "Cannot find mempool\n");
 		return ret;
 	}
 	offset = get_aligned_offset(&hdl->mem_hdl, bufptr) +
@@ -2324,7 +2690,7 @@ csm_dp_query_txbuf_status(unsigned int handle, void *bufptr, int *err)
 	ref_cnt = atomic_read(&bufobj->refcnt);
 	if (p->fence != CSM_DP_BUFFER_FENCE_SIG ||
 			p->signature != CSM_DP_BUFFER_SIG) {
-		DP_LOG_ERR(
+		DP_LOG_ERR(dev_handle,
 			"buffer %p corrupted,"
 			" fence 0x%x, expect 0x%x,"
 			" signature 0x%x, expect 0x%x,"
@@ -2355,7 +2721,10 @@ csm_dp_query_txbuf_status(unsigned int handle, void *bufptr, int *err)
 }
 #else
 csm_dp_txbuf_status_e
-csm_dp_query_txbuf_status(unsigned int handle, void *bufptr, int *err)
+csm_dp_query_txbuf_status(uint16_t dev_handle,
+			  unsigned int handle,
+			  void *bufptr,
+			  int *err)
 {
 
 	return CSM_DP_TX_BUF_STATUS_UNAVAIL;
@@ -2363,29 +2732,42 @@ csm_dp_query_txbuf_status(unsigned int handle, void *bufptr, int *err)
 #endif
 
 unsigned int
-csm_dp_num_alloc_txbuf_tx_in_progress(void)
+csm_dp_num_alloc_txbuf_tx_in_progress(uint16_t handle,
+					enum csm_dp_channel mode)
 {
-	return __csm_dp_num_alloc_tx_buf_tx_in_progress;
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
+
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return INVALID_HANDLE;
+
+	return __libData[bus][vf].tx_buf_inprogress[mode];
 }
 
 /**
  * @brief
  * Get driver layer statistics.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param stats - statistics placeholder.
  *
  * @return On success - 0, otherwise failed
  */
-int csm_dp_get_stats(struct csm_dp_ioctl_getstats *stats)
+int csm_dp_get_stats(uint16_t handle, struct csm_dp_ioctl_getstats *stats)
 {
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	int ret;
 
-	if (!csm_dp_is_inited())
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	if (!csm_dp_is_inited(handle))
 		return -EAGAIN;
 
-	ret = ioctl(__libData.fd, CSM_DP_IOCTL_GET_STATS, stats);
+	ret = ioctl(__libData[bus][vf].fd, CSM_DP_IOCTL_GET_STATS, stats);
 	if (ret)
-		DP_LOG_ERR("CSM_DP_IOCTL_GET_STATS failed, err=%d (%s)\n", ret, strerror(errno));
+		DP_LOG_ERR(handle, "CSM_DP_IOCTL_GET_STATS failed, err=%d (%s)\n", ret, strerror(errno));
 
 	return ret;
 }

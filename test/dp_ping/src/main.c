@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <syslog.h>
+#include <bsd/string.h>
 
 #include "csm_dp_api.h"
 
@@ -26,6 +27,7 @@
 #define DEFAULT_TX_INTVAL	1000000U
 #define	DEFAULT_TX_LENGTH	1024
 #define DEFAULT_CAPTURE_EVENT_NUM       64
+#define NUM_LAT_BUCKET 8
 
 /* To align with limit on CSM */
 #define	MAX_TX_LENGTH ((CSM_DP_MAX_DL_MSG_LEN < \
@@ -50,6 +52,7 @@ enum {
 	RESULT_THREAD,
 	NUM_OF_THREAD,
 };
+
 struct cmd_option {
 	unsigned int tx_length;
 	unsigned int tx_bundle;
@@ -77,6 +80,8 @@ struct cmd_option {
 	unsigned int tx_mirror;
 	unsigned int syslog;
 	unsigned int rx_poll_inteval_us;
+	unsigned int num_vf;
+	bool run_both;
 };
 
 struct dp_ping_pkt_hdr {
@@ -98,6 +103,49 @@ struct ping_result_fifo {
 	unsigned int head;
 	unsigned int tail;
 	struct ping_result *result;
+};
+
+struct packet_stats {
+	uint32_t _num_bad_checksum;
+	uint32_t _num_good_checksum;
+	uint32_t _num_ill_packet;
+	uint32_t _this_report_num_rcv;
+	uint32_t _num_rcv;
+	uint32_t _num_tx;
+	uint32_t _num_tx_drop;
+	uint32_t _num_tx_ok;
+	uint32_t _num_tx_err;
+	uint32_t _num_tx_in_prog;
+	uint32_t _num_tx_others;
+	uint32_t _num_out_seq;
+	uint32_t _num_report;
+	uint64_t _total_latency;
+	uint64_t _max_latency;
+	uint64_t _min_latency;
+	uint32_t print_time;
+	bool first_result;
+	unsigned int __ping_sequence;
+	unsigned int __ping_count;
+	unsigned int mem_pool_buf_size;
+	uint64_t last_driver_stats_tx_acked;
+	uint32_t latency_bucket[NUM_LAT_BUCKET];
+	unsigned int __exp_seq;
+	struct timespec report_start_ts;
+	struct timespec report_end_ts;
+};
+
+struct csm_dp_app_data {
+	int fd;
+	enum csm_dp_channel mode;
+	volatile bool __done;
+	pthread_t tid[NUM_OF_THREAD];
+	char _sg_tx_buf[MAX_TX_LENGTH * CSM_DP_MAX_SG_IOV_SIZE];
+	char _sg_rx_buf[MAX_TX_LENGTH * CSM_DP_MAX_SG_IOV_SIZE];
+	struct packet_stats stats;
+	struct ping_result_fifo __result_fifo;
+	struct csm_dp_cap_defcfg capcfg;
+	unsigned int rx_affinity;
+	unsigned int tx_affinity;
 };
 
 static struct cmd_option cmdline_option = {
@@ -123,12 +171,10 @@ static struct cmd_option cmdline_option = {
 	.tx_mirror = 0,
 	.syslog = 0,
 	.rx_poll_inteval_us = DEFAULT_RX_POLL_INTVAL_US,
+	.num_vf = 1,
+	.run_both = 0,
 };
 
-static pthread_t tid[NUM_OF_THREAD];
-static volatile bool __done = false;
-static int __csm_dp_fd = 0;
-static struct ping_result_fifo __result_fifo;
 struct csm_dp_cap_defcfg capcfg = {
 	.file_name = "/tmp/dp_ping.pcap",
 	.file_sz = SIZE_1M * 16,
@@ -137,6 +183,16 @@ struct csm_dp_cap_defcfg capcfg = {
 	.file_no_fflush = 1,
 };
 
+
+static pthread_t result_tid;
+static struct csm_dp_app_data dp_app_control[CSM_DP_MAX_BUS][CSM_DP_MAX_VF];
+static struct csm_dp_app_data dp_app_data[CSM_DP_MAX_BUS][CSM_DP_MAX_VF];
+static uint32_t latency_bucket_time[NUM_LAT_BUCKET] = {125, 250, 500, 750, 1000, 1500, 2000, 4000};
+
+static unsigned int rx_affinity=5;
+static unsigned int tx_affinity=16;
+static bool app_initialized_data;
+static bool app_initialized_control;
 void dump_pkt(char *pkt, unsigned int len)
 {
 	unsigned int i;
@@ -184,35 +240,9 @@ static const char __usage[] = \
 "   -L print latency statistics for this report period\n"
 "   -P polling mode (Tx/Rx over DATA channel)\n"
 "   -R fill packet payload from randon number generator\n"
-"   -V Virtual function (VF0..3), default 0\n";
-
-static uint32_t _num_bad_checksum;
-static uint32_t _num_good_checksum;
-static uint32_t _num_ill_packet;
-static uint32_t _this_report_num_rcv;
-static uint32_t _num_rcv;
-static uint32_t _num_tx;
-static uint32_t _num_tx_drop;
-static uint32_t _num_tx_ok;
-static uint32_t _num_tx_err;
-static uint32_t _num_tx_in_prog;
-static uint32_t _num_tx_others;
-static uint32_t _num_out_seq;
-static uint32_t _num_report;
-static uint64_t _total_latency;
-static uint64_t _max_latency;
-static uint64_t _min_latency;
-#define NUM_LAT_BUCKET 8
-static uint32_t latency_bucket_time[NUM_LAT_BUCKET] = {125, 250, 500, 750, 1000, 1500, 2000, 4000};
-static uint32_t latency_bucket[NUM_LAT_BUCKET];
-static unsigned int __exp_seq;
-static struct timespec report_start_ts;
-static struct timespec report_end_ts;
-
-static uint64_t last_driver_stats_tx_acked;
-
-static char _sg_tx_buf[MAX_TX_LENGTH * CSM_DP_MAX_SG_IOV_SIZE];
-static char _sg_rx_buf[MAX_TX_LENGTH * CSM_DP_MAX_SG_IOV_SIZE];
+"   -V Virtual function (VF0..3), default 0\n"
+"   -n No of Virtual functions to be run(1..4), default 1\n"
+"   -N run both channels, 0 for one channel, 1 for control & data, default 0\n";
 
 static inline void __getopt_val(const char *opt, unsigned int *p)
 {
@@ -280,13 +310,21 @@ static void __parse_cmdline(int argc, char *argv[]) {
 		{0, 0, 0, 0}
 	};
 
-	while ((c = getopt_long(argc, argv, "l:c:t:i:b:r:d:p:B:D:V:svxhmRLSGCPA:", long_options, &option_index)) != EOF) {
+	while ((c = getopt_long(argc, argv, "l:n:c:t:i:b:r:d:p:B:D:V:svxhmRLSGCPNA:", long_options, &option_index)) != EOF) {
 		switch (c) {
 		// short options
 		case 'l':
 			__getopt_val(optarg, &v);
 			if (v >= sizeof(struct dp_ping_pkt_hdr))
 				cmdline_option.tx_length = v;
+			break;
+		case 'n':
+			__getopt_val(optarg, &v);
+			if (v > CSM_DP_MAX_VF) {
+				printf("%s\n", __usage);
+				exit(0);
+			}
+				cmdline_option.num_vf = v;
 			break;
 		case 'c':
 			__getopt_val(optarg,  &cmdline_option.tx_count);
@@ -375,7 +413,9 @@ static void __parse_cmdline(int argc, char *argv[]) {
 			if (v)
 				cmdline_option.vf_num = v;
 			break;
-
+		case 'N':
+			cmdline_option.run_both = 1;
+			break;
 		// long options
 		case LONG_OPTION_INDEX_BUF_SIZE:
 			__getopt_val(optarg, &v);
@@ -535,7 +575,7 @@ static void calc_ts_diff(struct timespec *start, struct timespec *end, struct ti
 	diff->tv_sec = end->tv_sec - start->tv_sec;
 }
 
-static void _ping_print_report(void)
+static void _ping_print_report(struct csm_dp_app_data *dp_data)
 {
 	int i, ret;
 	struct timespec ts_diff;
@@ -543,62 +583,77 @@ static void _ping_print_report(void)
 	struct csm_dp_ioctl_getstats driver_stats = { 0 };
 	uint64_t this_report_tx_acked = 0;
 
-	driver_stats.ch = cmdline_option.poll_mode ? CSM_DP_CH_DATA : CSM_DP_CH_CONTROL;
-	ret = csm_dp_get_stats(&driver_stats);
+	uint16_t handle = csm_dp_get_handle(dp_data->fd);
+	if (handle == INVALID_HANDLE)
+		return;
+
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
+
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return;
+
+
+	driver_stats.ch = dp_data->mode ? CSM_DP_CH_DATA : CSM_DP_CH_CONTROL;
+	ret = csm_dp_get_stats(handle, &driver_stats);
 	if (!ret) {
-		this_report_tx_acked = driver_stats.tx_acked - last_driver_stats_tx_acked;
-		last_driver_stats_tx_acked = driver_stats.tx_acked;
+		this_report_tx_acked = driver_stats.tx_acked - dp_data->stats.last_driver_stats_tx_acked;
+		dp_data->stats.last_driver_stats_tx_acked = driver_stats.tx_acked;
 	}
 
-	calc_ts_diff(&report_start_ts, &report_end_ts, &ts_diff);
+	calc_ts_diff(&dp_data->stats.report_start_ts, &dp_data->stats.report_end_ts, &ts_diff);
 	diff_us = ts_diff.tv_sec * 1000000 + ts_diff.tv_nsec / 1000;
 
-	printf("\n\nReport %d\n", ++_num_report);
-	printf("  Tx Packets            :       %u\n", _num_tx);
-	printf("  Rx Packets            :       %u\n", _num_rcv);
+	printf("\n\n Bus:%d VF:%d %s Channel Report %d\n",
+				bus,
+				vf,
+				(dp_data->mode == CSM_DP_CH_DATA) ? "DATA" : "CONTROL",
+				++dp_data->stats._num_report);
+	printf("  Tx Packets            :       %u\n", dp_data->stats._num_tx);
+	printf("  Rx Packets            :       %u\n", dp_data->stats._num_rcv);
 	printf("  Tx Throughput (Mbps)  :       %.3f\n",
 		diff_us ? ((double)this_report_tx_acked * cmdline_option.tx_length * 8) / diff_us : 0);
 	printf("  Rx Throughput (Mbps)  :       %.3f\n",
-		diff_us ? ((double)_this_report_num_rcv * cmdline_option.tx_length * 8) / diff_us : 0);
-	printf("  Tx Packets Dropped    :       %u\n", _num_tx_drop);
-	printf("  Rx, Ill Format        :       %u\n", _num_ill_packet);
-	printf("  Rx, Out of Sequence   :       %u\n", _num_out_seq);
+		diff_us ? ((double)dp_data->stats._this_report_num_rcv * cmdline_option.tx_length * 8) / diff_us : 0);
+	printf("  Tx Packets Dropped    :       %u\n", dp_data->stats._num_tx_drop);
+	printf("  Rx, Ill Format        :       %u\n", dp_data->stats._num_ill_packet);
+	printf("  Rx, Out of Sequence   :       %u\n", dp_data->stats._num_out_seq);
 	if (cmdline_option.tx_status) {
-		printf("  Tx Status Done OK     :       %u\n", _num_tx_ok);
-		printf("  Tx Status In Prog     :       %u\n", _num_tx_in_prog);
-		printf("  Tx Status Err         :       %u\n", _num_tx_err);
-		printf("  Tx Status Others      :       %u\n", _num_tx_others);
+		printf("  Tx Status Done OK     :       %u\n", dp_data->stats._num_tx_ok);
+		printf("  Tx Status In Prog     :       %u\n", dp_data->stats._num_tx_in_prog);
+		printf("  Tx Status Err         :       %u\n", dp_data->stats._num_tx_err);
+		printf("  Tx Status Others      :       %u\n", dp_data->stats._num_tx_others);
 		printf("  Alloc Tx Buf Tx Busy  :       %u\n",
-						csm_dp_num_alloc_txbuf_tx_in_progress());
+						csm_dp_num_alloc_txbuf_tx_in_progress(handle, dp_data->mode));
 	}
 	if (cmdline_option.verify) {
-		printf("  Rx, Bad Checksum      :       %u\n", _num_bad_checksum);
-		printf("  Rx, Good Checksum     :       %u\n", _num_good_checksum);
+		printf("  Rx, Bad Checksum      :       %u\n", dp_data->stats._num_bad_checksum);
+		printf("  Rx, Good Checksum     :       %u\n", dp_data->stats._num_good_checksum);
 	}
-	if (_num_rcv && cmdline_option.latency_stat) {
+	if (dp_data->stats._num_rcv && cmdline_option.latency_stat) {
 		printf("Long Term Average latency  :       %ld us\n",
-						 _total_latency / _num_rcv);
-		if (_this_report_num_rcv) {
+						 dp_data->stats._total_latency / dp_data->stats._num_rcv);
+		if (dp_data->stats._this_report_num_rcv) {
 			printf("Min latency@this period     :       %ld us\n",
-						_min_latency);
+						dp_data->stats._min_latency);
 			printf("Max latency@this period     :       %ld us\n",
-						_max_latency);
+						dp_data->stats._max_latency);
 			printf("\n\nLatency Distribution\n");
 			printf("\n");
 			for (i = 0; i < NUM_LAT_BUCKET; i++)
 				printf("<  %6d us  ", latency_bucket_time[i]);
 			printf("\n");
 			for (i = 0; i < NUM_LAT_BUCKET; i++)
-				printf("%6d pkt    ", latency_bucket[i]);
+				printf("%6d pkt    ", dp_data->stats.latency_bucket[i]);
 			printf("\n");
-			memset(latency_bucket, 0, sizeof(latency_bucket));
+			memset(&dp_data->stats.latency_bucket, 0, sizeof(dp_data->stats.latency_bucket));
 		}
 		printf("packet receive@this period:       %u\n",
-						_this_report_num_rcv);
+						dp_data->stats._this_report_num_rcv);
 	}
-	_this_report_num_rcv = 0;
-	_min_latency = 0xffffffff;
-	_max_latency = 0;
+	dp_data->stats._this_report_num_rcv = 0;
+	dp_data->stats._min_latency = 0xffffffff;
+	dp_data->stats._max_latency = 0;
 }
 
 static void __ping_result_fifo_cleanup(struct ping_result_fifo *fifo)
@@ -609,17 +664,23 @@ static void __ping_result_fifo_cleanup(struct ping_result_fifo *fifo)
 	}
 }
 
-static int __csm_init(void)
+static int __csm_init(uint16_t handle, enum csm_dp_channel mode)
 {
 	int ret, fd;
 	unsigned int buf_size = cmdline_option.mem_pool_buf_size;
 	unsigned int buf_cnt = cmdline_option.mem_pool_buf_count;
 	unsigned int seg_size = cmdline_option.tx_length;
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 	char dev_name[20];
+	int dl_mode = (mode == CSM_DP_CH_CONTROL) ? CSM_DP_MEM_TYPE_DL_CONTROL : CSM_DP_MEM_TYPE_DL_DATA;
 	struct csm_dp_log_cfg log_cfg = {
 		.level = LOG_INFO,
 		.output = CSM_DP_LOG_OUTPUT_CONSOLE,
 	};
+
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
 
 	if (cmdline_option.tx_sg)
 		seg_size /= CSM_DP_MAX_SG_IOV_SIZE;
@@ -651,12 +712,12 @@ static int __csm_init(void)
 		log_cfg.output = CSM_DP_LOG_OUTPUT_SYSLOG;
 
 	snprintf(dev_name, sizeof(dev_name), "/dev/csm%d-dp%d",
-		cmdline_option.bus_num, cmdline_option.vf_num);
+		bus, vf);
 
 	printf("dp_ping packet count %d, packet length %d, interval %.3fus, device %s.\n",
 		cmdline_option.tx_count, cmdline_option.tx_length, cmdline_option.tx_intval_us, dev_name);
 	printf("%s channel, SG %sabled\n",
-		cmdline_option.poll_mode ? "DATA" : "CONTROL", cmdline_option.tx_sg ? "En" : "Dis");
+		mode ? "DATA" : "CONTROL", cmdline_option.tx_sg ? "En" : "Dis");
 
 	fd = csm_dp_init_ex(dev_name, &log_cfg);
 	if (fd < 0) {
@@ -665,51 +726,55 @@ static int __csm_init(void)
 	}
 
 	if (cmdline_option.tx_capture) {
-		snprintf(capcfg.file_name + strlen(capcfg.file_name), sizeof(capcfg.file_name)-strlen(capcfg.file_name), "_VF%d", cmdline_option.vf_num);
-		if (csm_dp_init_capture(NULL, &capcfg,
+		strlcpy(capcfg.file_name, "/tmp/dp_ping.pcap", sizeof(capcfg.file_name));
+		snprintf(capcfg.file_name + strlen(capcfg.file_name), sizeof(capcfg.file_name)-strlen(capcfg.file_name), "_BUS%d_VF%d", bus, vf);
+		if (csm_dp_init_capture(handle, NULL, &capcfg,
 					DEFAULT_CAPTURE_EVENT_NUM)) {
 			printf("csm_dp_init_capture failed\n");
+			close(fd);
 			return -EIO;
 		}
 		printf("Packet capture enabled, file name %s\n", capcfg.file_name);
 	}
 
-	ret = csm_dp_init_mem(cmdline_option.poll_mode ? CSM_DP_MEM_TYPE_DL_DATA : CSM_DP_MEM_TYPE_DL_CONTROL,
-		buf_size, buf_cnt);
+	ret = csm_dp_init_mem(handle, dl_mode, buf_size, buf_cnt);
 	if (ret) {
 		printf("csm_dp_init_mem failed\n");
+		close(fd);
 		return -1;
 	}
 
-	ret = csm_dp_init_rx();
+	ret = csm_dp_init_rx(handle);
 	if (ret) {
 		printf("csm_dp_init_rx failed\n");
+		close(fd);
 		return -1;
 	}
 
-	csm_dp_enable_capture(CSM_DP_CH_CONTROL);
-	csm_dp_enable_capture(CSM_DP_CH_DATA);
+	csm_dp_enable_capture(handle, CSM_DP_CH_CONTROL);
+	csm_dp_enable_capture(handle, CSM_DP_CH_DATA);
 
 	return fd;
 }
 
-static void __csm_cleanup(void)
+static void __csm_cleanup(uint16_t handle)
 {
+	printf("%s running\n", __func__);
 	if (cmdline_option.tx_capture)
-		csm_dp_cleanup_capture();
+		csm_dp_cleanup_capture(handle);
 	csm_dp_cleanup();
 }
 
-static void __csm_rx_drain(void)
+static void __csm_rx_drain(uint16_t handle, enum csm_dp_channel mode)
 {
 	struct iovec iov[CSM_DP_MAX_IOV_SIZE];
 	int ret, i, prev_ret = -1;
 
 	while (1) {
-		if (!cmdline_option.poll_mode)
-			ret = csm_dp_recv(iov, CSM_DP_MAX_IOV_SIZE);
+		if (mode == CSM_DP_CH_CONTROL)
+			ret = csm_dp_recv(handle, iov, CSM_DP_MAX_IOV_SIZE);
 		else
-			ret = csm_dp_rx_poll(iov, CSM_DP_MAX_IOV_SIZE);
+			ret = csm_dp_rx_poll(handle, iov, CSM_DP_MAX_IOV_SIZE);
 
 		if (ret < 0) {
 			break;
@@ -723,92 +788,120 @@ static void __csm_rx_drain(void)
 		prev_ret = ret;
 
 		for (i = 0; i < ret; i++)
-			csm_dp_free_rxbuf(iov[i].iov_base);
+			csm_dp_free_rxbuf(handle, iov[i].iov_base);
+	}
+}
+
+static void __result_proc(struct csm_dp_app_data *dp_data)
+{
+	uint64_t latency;
+	int i;
+
+	dp_data->stats._max_latency = 0;
+	dp_data->stats._min_latency = 0xffffffff;
+
+	struct ping_result result;
+
+	while (!__ping_result_get(&dp_data->__result_fifo, &result)) {
+		if (dp_data->stats.first_result) {
+			clock_gettime(CLOCK_MONOTONIC, &dp_data->stats.report_start_ts);
+			dp_data->stats.first_result = false;
+		}
+		clock_gettime(CLOCK_MONOTONIC, &dp_data->stats.report_end_ts);
+
+		if (result.ts.tv_sec) {
+			if (cmdline_option.verbose)
+				printf("%u bytes ping: seq=%u time=%lus.%luus\n",
+				cmdline_option.tx_length,
+				result.seq,
+				result.ts.tv_sec,
+				result.ts.tv_nsec / 1000);
+			latency = result.ts.tv_nsec / 1000 + result.ts.tv_sec * 1000000;
+		} else {
+			if (cmdline_option.verbose)
+				printf("%u bytes ping: seq=%u time=%luus\n",
+				cmdline_option.tx_length,
+				result.seq,
+				result.ts.tv_nsec / 1000);
+			latency = result.ts.tv_nsec / 1000;
+		}
+		dp_data->stats._total_latency += latency;
+		if (latency > dp_data->stats._max_latency)
+			dp_data->stats._max_latency = latency;
+		if (latency < dp_data->stats._min_latency)
+			dp_data->stats._min_latency = latency;
+
+		for (i = 0; i < NUM_LAT_BUCKET; i++) {
+			if (latency <= latency_bucket_time[i]) {
+				dp_data->stats.latency_bucket[i]++;
+				break;
+			}
+		}
+		if (i == NUM_LAT_BUCKET)
+			dp_data->stats.latency_bucket[i - 1]++;
+	}
+	usleep(cmdline_option.result_intval);
+	dp_data->stats.print_time += cmdline_option.result_intval / 1000;
+	if (dp_data->stats.print_time >= cmdline_option.report_period * 1000) {
+		_ping_print_report(dp_data);
+		dp_data->stats.print_time = 0;
+		dp_data->stats.first_result = true;
 	}
 }
 
 static void *__result_main(__attribute__((unused)) void *arg)
 {
-	uint32_t print_time = 0;
-	uint64_t latency;
-	int i;
-	bool first_result = true;
+	int mode = cmdline_option.poll_mode;
+	int bus_index, vf_index, done = 0;
+	struct csm_dp_app_data (*dp_data)[CSM_DP_MAX_VF] = NULL;
 
-	_max_latency = 0;
-	_min_latency = 0xffffffff;
-	while (!__done) {
-		struct ping_result result;
-
-		while (!__ping_result_get(&__result_fifo, &result)) {
-			if (first_result) {
-				clock_gettime(CLOCK_MONOTONIC, &report_start_ts);
-				first_result = false;
-			}
-			clock_gettime(CLOCK_MONOTONIC, &report_end_ts);
-
-			if (result.ts.tv_sec) {
-				if (cmdline_option.verbose)
-					printf("%u bytes ping: seq=%u time=%lus.%luus\n",
-					cmdline_option.tx_length,
-					result.seq,
-					result.ts.tv_sec,
-					result.ts.tv_nsec / 1000);
-				latency = result.ts.tv_nsec / 1000 + result.ts.tv_sec * 1000000;
-			} else {
-				if (cmdline_option.verbose)
-					printf("%u bytes ping: seq=%u time=%luus\n",
-					cmdline_option.tx_length,
-					result.seq,
-					result.ts.tv_nsec / 1000);
-				latency = result.ts.tv_nsec / 1000;
-			}
-			_total_latency += latency;
-			if (latency > _max_latency)
-				_max_latency = latency;
-			if (latency < _min_latency)
-				_min_latency = latency;
-
-			for (i = 0; i < NUM_LAT_BUCKET; i++) {
-				if (latency <= latency_bucket_time[i]) {
-					latency_bucket[i]++;
-					break;
+	while (!done) {
+		if (mode == CSM_DP_CH_CONTROL || cmdline_option.run_both) {
+			dp_data = dp_app_control;
+			for (bus_index = 0; bus_index < CSM_DP_MAX_BUS; bus_index++) {
+				for (vf_index = 0; vf_index < CSM_DP_MAX_VF; vf_index++) {
+					if (dp_data[bus_index][vf_index].fd < 0)
+						continue;
+					__result_proc(&dp_data[bus_index][vf_index]);
 				}
 			}
-			if (i == NUM_LAT_BUCKET)
-				latency_bucket[i - 1]++;
 		}
-		usleep(cmdline_option.result_intval);
-		print_time += cmdline_option.result_intval / 1000;
-		if (print_time >= cmdline_option.report_period * 1000) {
-			_ping_print_report();
-			print_time = 0;
-			first_result = true;
+
+		if (mode == CSM_DP_CH_DATA || cmdline_option.run_both) {
+			dp_data = dp_app_data;
+			for (bus_index = 0; bus_index < CSM_DP_MAX_BUS; bus_index++) {
+				for (vf_index = 0; vf_index < CSM_DP_MAX_VF; vf_index++) {
+					if (dp_data[bus_index][vf_index].fd < 0)
+						continue;
+					__result_proc(&dp_data[bus_index][vf_index]);
+				}
+			}
 		}
+		done = dp_data[0][0].__done;
 	}
-	_ping_print_report();
 	return NULL;
 }
 
-static void __validate_rx_buf(struct dp_ping_pkt_hdr *hdr)
+static void __validate_rx_buf(struct dp_ping_pkt_hdr *hdr, struct csm_dp_app_data *dp_data)
 {
 	struct ping_result result;
 	struct timespec now;
 	uint32_t gcrc;
 
-	if (hdr->magic != (unsigned int)tid[1]) {
-		_num_ill_packet++;
+	if (hdr->magic != (unsigned int)dp_data->tid[1]) {
+		dp_data->stats._num_ill_packet++;
 		return;
 	}
 
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	calc_ts_diff(&hdr->ts, &now, &result.ts);
 	result.seq = hdr->seq;
-	if (hdr->seq != __exp_seq)
-		_num_out_seq++;
-	__exp_seq = hdr->seq + 1;
+	if (hdr->seq != dp_data->stats.__exp_seq)
+		dp_data->stats._num_out_seq++;
+	dp_data->stats.__exp_seq = hdr->seq + 1;
 
 	if (!cmdline_option.verify) {
-		__ping_result_add(&__result_fifo, &result);
+		__ping_result_add(&dp_data->__result_fifo, &result);
 		return;
 	}
 
@@ -817,13 +910,13 @@ static void __validate_rx_buf(struct dp_ping_pkt_hdr *hdr)
 		cmdline_option.tx_length -
 		sizeof(struct dp_ping_pkt_hdr));
 	if (hdr->checksum == gcrc) {
-		_num_good_checksum++;
-		__ping_result_add(&__result_fifo, &result);
+		dp_data->stats._num_good_checksum++;
+		__ping_result_add(&dp_data->__result_fifo, &result);
 		return;
 	}
 
 	/* bad chechsum */
-	_num_bad_checksum++;
+	dp_data->stats._num_bad_checksum++;
 	printf("bad checksum seq %x header %lx checksum %x gen %x\n",
 		hdr->seq,
 		sizeof(struct dp_ping_pkt_hdr),
@@ -833,11 +926,12 @@ static void __validate_rx_buf(struct dp_ping_pkt_hdr *hdr)
 		cmdline_option.tx_length);
 }
 
-static int __validate_rx_sg(struct iovec *iov, int n, int start_index)
+static int __validate_rx_sg(struct iovec *iov, int n, int start_index, struct csm_dp_app_data *dp_data)
 {
 	unsigned int sg_len = 0;
+	uint16_t dp_handle = csm_dp_get_handle(dp_data->fd);
 	int i;
-	char *s = _sg_rx_buf;
+	char *s = dp_data->_sg_rx_buf;
 
 	for (i = start_index; i < n; i++) {
 		if (cmdline_option.verbose)
@@ -852,7 +946,7 @@ static int __validate_rx_sg(struct iovec *iov, int n, int start_index)
 				memcpy(s, iov[i].iov_base, sizeof(struct dp_ping_pkt_hdr));
 			s += CSM_DP_DEFAULT_UL_BUF_SIZE;
 
-			csm_dp_free_rxbuf(iov[i].iov_base);
+			csm_dp_free_rxbuf(dp_handle, iov[i].iov_base);
 			continue;
 		}
 
@@ -867,9 +961,9 @@ static int __validate_rx_sg(struct iovec *iov, int n, int start_index)
 			printf("sg recv length %u doesn't match expected %u\n", sg_len, cmdline_option.tx_length);
 		}
 
-		__validate_rx_buf((struct dp_ping_pkt_hdr *)_sg_rx_buf);
+		__validate_rx_buf((struct dp_ping_pkt_hdr *)dp_data->_sg_rx_buf, dp_data);
 
-		csm_dp_free_rxbuf(iov[i].iov_base);
+		csm_dp_free_rxbuf(dp_handle, iov[i].iov_base);
 		goto out;
 	}
 
@@ -879,39 +973,45 @@ out:
 	return i - start_index;
 }
 
-static int __rx_proc(struct iovec *iov, int n)
+static int __rx_proc(struct iovec *iov, int n, struct csm_dp_app_data *dp_data)
 {
 	int i;
+	uint16_t dp_handle = csm_dp_get_handle(dp_data->fd);
 
 	for (i = 0; i < n; i++) {
-		_num_rcv++;
-		_this_report_num_rcv++;
+		dp_data->stats._num_rcv++;
+		dp_data->stats._this_report_num_rcv++;
 		if (iov[i].iov_len == 0) {
 			/* start of sg chain */
-			i += __validate_rx_sg(iov, n, i);
+			i += __validate_rx_sg(iov, n, i, dp_data);
 			continue;
 		}
 		else if (iov[i].iov_len == cmdline_option.tx_length) {
 			if (cmdline_option.verbose)
 				printf("recv length %ld\n", iov[i].iov_len);
-			__validate_rx_buf(iov[i].iov_base);
+			__validate_rx_buf(iov[i].iov_base, dp_data);
 		} else {
 			struct dp_ping_pkt_hdr *hdr = (struct dp_ping_pkt_hdr *)iov[i].iov_base;
 			printf("recv length %ld don't match %d. seq %d exp seq %d\n",
 				iov[i].iov_len,
 				cmdline_option.tx_length,
-				hdr->seq, __exp_seq);
+				hdr->seq, dp_data->stats.__exp_seq);
 		}
-		csm_dp_free_rxbuf(iov[i].iov_base);
+		csm_dp_free_rxbuf(dp_handle, iov[i].iov_base);
 	}
 
 	return 0;
 }
 
-static void *__rx_main(__attribute__((unused)) void *arg)
+static void *__rx_main(void *arg)
 {
-	int fd = __csm_dp_fd;
+	struct csm_dp_app_data *dp_data = (struct csm_dp_app_data *)arg;
+	int fd = dp_data->fd;
+	uint16_t dp_handle = csm_dp_get_handle(fd);
 	int ret;
+
+	if (dp_handle == INVALID_HANDLE)
+		return NULL;
 
 	if (cmdline_option.rx_affinity) {
 		ret = thread_set_affinity(pthread_self(), cmdline_option.rx_affinity);
@@ -921,13 +1021,21 @@ static void *__rx_main(__attribute__((unused)) void *arg)
 		}
 		printf("Set RX thread CPU affinity to 0x%x\n", cmdline_option.rx_affinity);
 	}
+	else {
+		ret = thread_set_affinity(pthread_self(), dp_data->rx_affinity);
+		if (ret) {
+			printf("Set RX Thread affinity 0x%x failed\n", dp_data->rx_affinity);
+			return NULL;
+		}
+		printf("RX Control thread assigned to CPU %d affinity\n", dp_data->rx_affinity);
+	}
 
 	if (cmdline_option.rx_timeout < cmdline_option.tx_intval_us + RX_TIMEOUT_GUARD) {
 		cmdline_option.rx_timeout = cmdline_option.tx_intval_us + RX_TIMEOUT_GUARD;
 		printf("rx_timeout adjusted to %dus\n", cmdline_option.rx_timeout);
 	}
 
-	while (!__done) {
+	while (! dp_data->__done) {
 		struct timeval tmval;
 		fd_set fds;
 		int ret, n;
@@ -941,7 +1049,7 @@ static void *__rx_main(__attribute__((unused)) void *arg)
 
 		ret = select(fd + 1, &fds, NULL, NULL, &tmval);
 
-		if (__done)
+		if (dp_data->__done)
 			break;
 
 		if (ret < 0) {
@@ -953,18 +1061,23 @@ static void *__rx_main(__attribute__((unused)) void *arg)
 			continue;
 		}
 
-		while ((n = csm_dp_recv(iov, CSM_DP_MAX_IOV_SIZE)) > 0) {
-			if (__rx_proc(iov, n))
+		while ((n = csm_dp_recv(dp_handle, iov, CSM_DP_MAX_IOV_SIZE)) > 0) {
+			if (__rx_proc(iov, n, dp_data))
 				break;
 		}
 	}
 	return NULL;
 }
 
-static void *__rx_poll_main(__attribute__((unused)) void *arg)
+static void *__rx_poll_main(void *arg)
 {
+	struct csm_dp_app_data *dp_data = (struct csm_dp_app_data *)arg;
 	struct iovec iov[CSM_DP_MAX_IOV_SIZE];
+	uint16_t dp_handle = csm_dp_get_handle(dp_data->fd);
 	int ret;
+
+	if (dp_handle == INVALID_HANDLE)
+		return NULL;
 
 	if (cmdline_option.rx_affinity) {
 		ret = thread_set_affinity(pthread_self(), cmdline_option.rx_affinity);
@@ -974,15 +1087,23 @@ static void *__rx_poll_main(__attribute__((unused)) void *arg)
 		}
 		printf("Set RX thread CPU affinity to 0x%x\n", cmdline_option.rx_affinity);
 	}
+	else {
+		ret = thread_set_affinity(pthread_self(), dp_data->rx_affinity);
+		if (ret) {
+			printf("Set RX Thread affinity 0x%x failed\n", dp_data->rx_affinity);
+			return NULL;
+		}
+		printf("RX Data thread assigned to CPU %d affinity\n", dp_data->rx_affinity);
+	}
 
-	while (!__done) {
-		ret = csm_dp_rx_poll(iov, CSM_DP_MAX_IOV_SIZE);
+	while (! dp_data->__done) {
+		ret = csm_dp_rx_poll(dp_handle, iov, CSM_DP_MAX_IOV_SIZE);
 		if (ret < 0) {
 			printf("csm_dp_rx_poll failed %d\n", ret);
 			continue;
 		}
 
-		if (__rx_proc(iov, ret))
+		if (__rx_proc(iov, ret, dp_data))
 			break;
 
 		if (ret < CSM_DP_MAX_IOV_SIZE)
@@ -992,11 +1113,11 @@ static void *__rx_poll_main(__attribute__((unused)) void *arg)
 	return NULL;
 }
 
-static unsigned int __ping_sequence = 0;
-static unsigned int __ping_count = 0;
-
-static int __create_ping_pkt(struct iovec *iov, unsigned int iovcnt,
-	unsigned int *iohandle)
+static int __create_ping_pkt(uint16_t dp_handle,
+			     struct iovec *iov,
+			     unsigned int iovcnt,
+			     unsigned int *iohandle,
+			     struct csm_dp_app_data *dp_data)
 {
 	unsigned int i;
 	uint32_t *p;
@@ -1024,16 +1145,15 @@ static int __create_ping_pkt(struct iovec *iov, unsigned int iovcnt,
 		if (!cmdline_option.tx_sg)
 			iov[i].iov_len = cmdline_option.tx_length;
 		iov[i].iov_base =
-			csm_dp_ealloc_txbuf(cmdline_option.poll_mode ? CSM_DP_MEM_TYPE_DL_DATA : CSM_DP_MEM_TYPE_DL_CONTROL,
-				iov[i].iov_len, &iohandle[i]);
+			csm_dp_ealloc_txbuf(dp_handle, cmdline_option.poll_mode ? CSM_DP_MEM_TYPE_DL_DATA : CSM_DP_MEM_TYPE_DL_CONTROL, iov[i].iov_len, &iohandle[i]);
 		if (!iov[i].iov_base) {
 			printf("csm_dp_alloc_txbuf failed\n");
 			return -1;
 		}
 		if (i == 0 || !cmdline_option.tx_sg) {
 			hdr = iov[i].iov_base;
-			hdr->seq = __ping_sequence++;
-			hdr->magic = (unsigned int)tid[TX_THREAD];
+			hdr->seq = dp_data->stats.__ping_sequence++;
+			hdr->magic = (unsigned int)dp_data->tid[TX_THREAD];
 			clock_gettime(CLOCK_MONOTONIC, &hdr->ts);
 		} else {
 			memset(iov[i].iov_base, 0,  sizeof(struct dp_ping_pkt_hdr));
@@ -1061,16 +1181,16 @@ static int __create_ping_pkt(struct iovec *iov, unsigned int iovcnt,
 	if (cmdline_option.verify && cmdline_option.tx_sg) {
 		struct dp_ping_pkt_hdr *hdr =  iov[0].iov_base;
 		char *d;
-		char *s =  _sg_tx_buf;
+		char *s =  dp_data->_sg_tx_buf;
 
-		p = (uint32_t *)_sg_tx_buf;
+		p = (uint32_t *)dp_data->_sg_tx_buf;
 		for (j = 0; j < num; j++, p++)
 			if (cmdline_option.random)
 				*p = rand();
 			else
 				*p = hdr->seq + j;
 		hdr->checksum = pkgen_crc32(
-				(u_int8_t *)(_sg_tx_buf),
+				(u_int8_t *)(dp_data->_sg_tx_buf),
 				cmdline_option.tx_length -
 					sizeof(struct dp_ping_pkt_hdr));
 		for (i = 0; i < iovcnt; i++) {
@@ -1088,37 +1208,48 @@ static int __create_ping_pkt(struct iovec *iov, unsigned int iovcnt,
 	return 0;
 }
 
-static int __free_ping_pkt(struct iovec *iov, unsigned int iovcnt,
-	unsigned int *iohandle)
+static int __free_ping_pkt(uint16_t dp_handle,
+			   struct iovec *iov,
+			   unsigned int iovcnt,
+			   unsigned int *iohandle,
+			   struct csm_dp_app_data *dp_data)
 {
 	unsigned int i;
 	csm_dp_txbuf_status_e status;
 
+	if (dp_handle == INVALID_HANDLE)
+		return INVALID_HANDLE;
+
 	for (i = 0; i < iovcnt; i++) {
-		status = csm_dp_query_txbuf_status(iohandle[i],
+		status = csm_dp_query_txbuf_status(dp_handle, iohandle[i],
 						iov[i].iov_base, NULL);
 		if (status == CSM_DP_TX_BUF_STATUS_TX_ERR ||
 				status == CSM_DP_TX_BUF_STATUS_TX_ERR_BUSY)
-			_num_tx_err++;
+			dp_data->stats._num_tx_err++;
 		else if (status == CSM_DP_TX_BUF_STATUS_TX_IN_PROGRESS)
-			_num_tx_in_prog++;
+			dp_data->stats._num_tx_in_prog++;
 		else if (status == CSM_DP_TX_BUF_STATUS_TX_OK ||
 			status == CSM_DP_TX_BUF_STATUS_TX_OK_BUSY)
-			_num_tx_ok++;
+			dp_data->stats._num_tx_ok++;
 		else
-			_num_tx_others++;
+			dp_data->stats._num_tx_others++;
 	}
 	return 0;
 }
 
-static void *__tx_main(__attribute__((unused)) void *arg)
+static void *__tx_main(void *arg)
 {
+	struct csm_dp_app_data *dp_data = (struct csm_dp_app_data *)arg;
 	int ret;
+	uint16_t dp_handle = csm_dp_get_handle(dp_data->fd);
 	struct csm_dp_ioctl_getstats driver_stats = { 0 };
 	struct timespec intval = {
 		(long)cmdline_option.tx_intval_us / 1000000,
 		(long)(cmdline_option.tx_intval_us * 1000) % 1000000000
 	};
+
+	if (dp_handle == INVALID_HANDLE)
+		return NULL;
 
 	if (cmdline_option.tx_affinity) {
 		ret = thread_set_affinity(pthread_self(), cmdline_option.tx_affinity);
@@ -1128,6 +1259,14 @@ static void *__tx_main(__attribute__((unused)) void *arg)
 		}
 		printf("Set TX thread CPU affinity to 0x%x\n", cmdline_option.tx_affinity);
 	}
+	else {
+		ret = thread_set_affinity(pthread_self(), dp_data->tx_affinity);
+		if (ret) {
+			printf("Set TX Thread affinity 0x%x failed\n", dp_data->tx_affinity);
+			return NULL;
+		}
+		printf("TX %s thread assigned to CPU %d affinity\n", (dp_data->mode == CSM_DP_CH_DATA) ? "DATA" : "CONTROL", dp_data->tx_affinity);
+	}
 
 	/* If packet length is less than threshold, no scatter gather */
 	if (cmdline_option.tx_sg &&
@@ -1136,26 +1275,26 @@ static void *__tx_main(__attribute__((unused)) void *arg)
 					CSM_DP_MAX_SG_IOV_SIZE))
 		cmdline_option.tx_sg = false;
 
-	driver_stats.ch = cmdline_option.poll_mode ? CSM_DP_CH_DATA : CSM_DP_CH_CONTROL;
-	ret = csm_dp_get_stats(&driver_stats);
+	driver_stats.ch = dp_data->mode ? CSM_DP_CH_DATA : CSM_DP_CH_CONTROL;
+	ret = csm_dp_get_stats(dp_handle, &driver_stats);
 	if (ret)
 		/* continue without driver stats */
 		printf("warning: csm_dp_get_stats failed %d\n", ret);
 	else
-		last_driver_stats_tx_acked = driver_stats.tx_acked;
+		dp_data->stats.last_driver_stats_tx_acked = driver_stats.tx_acked;
 
 	while (1) {
 		struct iovec iov[CSM_DP_MAX_IOV_SIZE];
 		unsigned int iohandle[CSM_DP_MAX_IOV_SIZE];
 		unsigned int n;
-		enum csm_dp_channel ch = cmdline_option.poll_mode ? CSM_DP_CH_DATA : CSM_DP_CH_CONTROL;
+		enum csm_dp_channel ch = dp_data->mode ? CSM_DP_CH_DATA : CSM_DP_CH_CONTROL;
 		unsigned int flags = 0;
 
 		if (cmdline_option.tx_count) {
 			if (cmdline_option.tx_sg)
 				n = 1;
 			else  {
-				n = cmdline_option.tx_count - __ping_count;
+				n = cmdline_option.tx_count - dp_data->stats.__ping_count;
 				if (n > cmdline_option.tx_bundle)
 					n = cmdline_option.tx_bundle;
 			}
@@ -1166,7 +1305,7 @@ static void *__tx_main(__attribute__((unused)) void *arg)
 				n = cmdline_option.tx_bundle;
 		}
 
-		if (__create_ping_pkt(iov, n, iohandle))
+		if (__create_ping_pkt(dp_handle, iov, n, iohandle, dp_data))
 			break;
 
 		if (cmdline_option.tx_sg)
@@ -1175,104 +1314,222 @@ static void *__tx_main(__attribute__((unused)) void *arg)
 			flags |= CSM_DP_TX_FLAG_MIRROR;
 
 		if (cmdline_option.tx_sg)
-			ret = csm_dp_send(ch, iov, CSM_DP_MAX_SG_IOV_SIZE, flags);
+			ret = csm_dp_send(dp_handle, ch, iov, CSM_DP_MAX_SG_IOV_SIZE, flags);
 		else
-			ret = csm_dp_send(ch, iov, n, flags);
+			ret = csm_dp_send(dp_handle, ch, iov, n, flags);
 
 		if (ret >= 0)
-			_num_tx += n;
+			dp_data->stats._num_tx += n;
 		else
-			_num_tx_drop += n;
+			dp_data->stats._num_tx_drop += n;
 
-		__ping_count += n;
+		dp_data->stats.__ping_count += n;
 		if (cmdline_option.tx_intval_us)
 			nanosleep(&intval, NULL);
-		__free_ping_pkt(iov,
+		__free_ping_pkt(dp_handle, iov,
 			(cmdline_option.tx_sg) ? CSM_DP_MAX_SG_IOV_SIZE : n,
-			iohandle);
+			iohandle, dp_data);
 		if (cmdline_option.tx_count &&
-				__ping_count >= cmdline_option.tx_count)
+				dp_data->stats.__ping_count >= cmdline_option.tx_count)
 			break;
 	}
 	/* sleep 1 second for loopback packets to come back, before declare done */
 	sleep(1);
-	__done = true;
+	dp_data->__done = true;
 	return NULL;
 }
 
-static int __rx_init(void)
+static int __rx_init(struct csm_dp_app_data *dp_data, enum csm_dp_channel mode)
 {
 	int ret;
+	char thread_name[30] = {0x00};
+	uint16_t handle = csm_dp_get_handle(dp_data->fd);
+	if (handle == INVALID_HANDLE)
+		return -EINVAL;
 
-	if (cmdline_option.poll_mode)
-		ret = pthread_create(&tid[RX_THREAD], NULL, __rx_poll_main, NULL);
-	else
-		ret = pthread_create(&tid[RX_THREAD], NULL, __rx_main, NULL);
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
 
-	if (!ret)
-		pthread_setname_np(tid[RX_THREAD], "RX_THREAD");
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	if (mode == CSM_DP_CH_DATA) {
+		dp_data->rx_affinity = rx_affinity++;
+		ret = pthread_create(&dp_data->tid[RX_THREAD], NULL, __rx_poll_main, (void *)dp_data);
+		if (!ret) {
+			snprintf(thread_name, sizeof(thread_name), "RX_DATA_%u_%u",
+				bus, vf);
+			pthread_setname_np(dp_data->tid[RX_THREAD], thread_name);
+			printf("%s created successfully\n", thread_name);
+			dp_data->rx_affinity = rx_affinity++;
+		}
+	}
+	else {
+		dp_data->rx_affinity = rx_affinity++;
+		ret = pthread_create(&dp_data->tid[RX_THREAD], NULL, __rx_main, (void *)dp_data);
+		if (!ret) {
+			snprintf(thread_name, sizeof(thread_name), "RX_CONTROL_%u_%u",
+				bus, vf);
+			pthread_setname_np(dp_data->tid[RX_THREAD], thread_name);
+			printf("%s created successfully\n", thread_name);
+		}
+	}
 
 	return ret;
 }
 
-static int __tx_init(void)
+static int __tx_init(struct csm_dp_app_data *dp_data, enum csm_dp_channel mode)
 {
-	int ret = pthread_create(&tid[TX_THREAD], NULL, __tx_main, NULL);
+	int ret;
+	char thread_name[30] = {0x00};
+	uint16_t handle = csm_dp_get_handle(dp_data->fd);
+        if (handle == INVALID_HANDLE)
+                return -EINVAL;
 
-	if (!ret)
-		pthread_setname_np(tid[TX_THREAD], "TX_THREAD");
+        unsigned int bus = csm_dp_get_bus_index(handle);
+        unsigned int vf = csm_dp_get_vf_index(handle);
+
+        if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+                return -EINVAL;
+
+	if (mode == CSM_DP_CH_DATA) {
+		dp_data->tx_affinity = tx_affinity++;
+		ret = pthread_create(&dp_data->tid[TX_THREAD], NULL, __tx_main, (void *)dp_data);
+		if (!ret) {
+			snprintf(thread_name, sizeof(thread_name), "TX_DATA_%u_%u",
+				bus, vf);
+			pthread_setname_np(dp_data->tid[TX_THREAD], thread_name);
+			printf("%s created successfully\n", thread_name);
+		}
+	}
+	else {
+		dp_data->tx_affinity = tx_affinity++;
+		ret = pthread_create(&dp_data->tid[TX_THREAD], NULL, __tx_main, (void *)dp_data);
+		if (!ret) {
+			snprintf(thread_name, sizeof(thread_name), "TX_CONTROL_%u_%u",
+				bus, vf);
+			pthread_setname_np(dp_data->tid[TX_THREAD], thread_name);
+			printf("%s created successfully\n", thread_name);
+		}
+	}
 
 	return ret;
 }
 
 static int __result_init(void)
 {
-	int ret = pthread_create(&tid[RESULT_THREAD], NULL, __result_main, NULL);
+	int ret = pthread_create(&result_tid, NULL, __result_main, NULL);
 
 	if (!ret)
-		pthread_setname_np(tid[RESULT_THREAD], "RESULT_THREAD");
+		pthread_setname_np(result_tid, "RESULT_THREAD");
 
 	return ret;
 }
 
-int main(int argc, char *argv[])
+static int create_dp_ping_instance(uint16_t handle, enum csm_dp_channel mode)
 {
-	int fd;
-	void *res;
+	int fd, i, j;
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
+	struct csm_dp_app_data (*dp_data)[CSM_DP_MAX_VF] = (mode == CSM_DP_CH_CONTROL) ? dp_app_control : dp_app_data;
+	bool *init = (mode == CSM_DP_CH_CONTROL) ? &app_initialized_control : &app_initialized_data;
 
-	__parse_cmdline(argc, argv);
+	if(*init == false) {
+		for (i = 0; i < CSM_DP_MAX_BUS; i++){
+			for (j = 0; j < CSM_DP_MAX_VF; j++)
+				dp_data[i][j].fd = -1;
+		}
+		*init = true;
+	}
 
-	if (__ping_result_fifo_init(&__result_fifo, cmdline_option.result_fifo_depth)) return -1;
-
-	fd = __csm_init();
+	fd = __csm_init(handle, mode);
 	if (fd < 0) return -1;
 
-	__csm_dp_fd = fd;
-	__csm_rx_drain();
+	dp_data[bus][vf].fd = fd;
+	dp_data[bus][vf].mode = mode;
+	dp_data[bus][vf].stats.first_result = true;
+	__csm_rx_drain(handle, mode);
 
-	if (__rx_init()) {
+	if (__ping_result_fifo_init(&dp_data[bus][vf].__result_fifo,
+		cmdline_option.result_fifo_depth)) return -1;
+
+	if (__rx_init(&dp_data[bus][vf], mode)) {
 		printf("rx_init failed\n");
 		return -1;
 	}
-	if (__tx_init()) {
-		pthread_cancel(tid[RX_THREAD]);
+	if (__tx_init(&dp_data[bus][vf], mode)) {
+		pthread_cancel(dp_data[bus][vf].tid[RX_THREAD]);
+		__ping_result_fifo_cleanup(&dp_data[bus][vf].__result_fifo);
 		printf("tx_init failed\n");
 		return -1;
 	}
+	return 0;
+}
+
+int main(int argc, char *argv[])
+{
+	int ret;
+	unsigned int i;
+	unsigned int bus, vf;
+	uint16_t handle;
+	void *res;
+	__parse_cmdline(argc, argv);
+
+	bus = cmdline_option.bus_num;
+	vf = cmdline_option.vf_num;
+
+	for (i = 0; i < cmdline_option.num_vf; i++) {
+		if (cmdline_option.num_vf > 1)
+			vf = i;
+
+		handle = CREATE_HANDLE(bus, vf);
+
+		if (cmdline_option.poll_mode == CSM_DP_CH_CONTROL || cmdline_option.run_both) {
+			ret = create_dp_ping_instance(handle, CSM_DP_CH_CONTROL);
+			if (ret < 0) {
+				printf("dp_ping_instance creation failed ret: %d\n", ret);
+				return ret;
+			}
+			printf("\n\n");
+		}
+
+		if (cmdline_option.poll_mode == CSM_DP_CH_DATA || cmdline_option.run_both) {
+			ret = create_dp_ping_instance(handle, CSM_DP_CH_DATA);
+			if (ret < 0) {
+				printf("dp_ping_instance creation failed ret: %d\n", ret);
+				return ret;
+			}
+			printf("\n\n");
+		}
+	}
+
 	if (__result_init()) {
-		pthread_cancel(tid[RX_THREAD]);
-		pthread_cancel(tid[TX_THREAD]);
-		__ping_result_fifo_cleanup(&__result_fifo);
 		printf("result_init failed\n");
 		return -1;
 	}
 
-	pthread_join(tid[RX_THREAD], &res);
-	pthread_join(tid[TX_THREAD], &res);
-	pthread_join(tid[RESULT_THREAD], &res);
-	__ping_result_fifo_cleanup(&__result_fifo);
+	pthread_join(result_tid, &res);
+	for (i = 0; i < cmdline_option.num_vf; i++) {
+		if (cmdline_option.num_vf > 1)
+			vf = i;
 
-	__csm_cleanup();
+		handle = CREATE_HANDLE(bus, vf);
 
+		if (cmdline_option.poll_mode == CSM_DP_CH_CONTROL || cmdline_option.run_both) {
+			struct csm_dp_app_data (*dp_data)[CSM_DP_MAX_VF] = dp_app_control;
+			pthread_join(dp_data[bus][vf].tid[RX_THREAD], &res);
+			pthread_join(dp_data[bus][vf].tid[TX_THREAD], &res);
+			__ping_result_fifo_cleanup(&dp_data[bus][vf].__result_fifo);
+			__csm_cleanup(handle);
+		}
+
+		if (cmdline_option.poll_mode == CSM_DP_CH_DATA || cmdline_option.run_both) {
+			struct csm_dp_app_data (*dp_data)[CSM_DP_MAX_VF] = dp_app_data;
+			pthread_join(dp_data[bus][vf].tid[RX_THREAD], &res);
+			pthread_join(dp_data[bus][vf].tid[TX_THREAD], &res);
+			__ping_result_fifo_cleanup(&dp_data[bus][vf].__result_fifo);
+			__csm_cleanup(handle);
+		}
+	}
 	return 0;
 }

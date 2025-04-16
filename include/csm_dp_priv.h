@@ -18,11 +18,11 @@ extern "C" {
 
 #define DEFAULT_BUFFER_SIZE	2048
 
-#define DP_LOG_DEBUG(...) csm_dp_log(LOG_DEBUG, __VA_ARGS__)
-#define DP_LOG_INFO(...) csm_dp_log(LOG_INFO, __VA_ARGS__)
-#define DP_LOG_WARN(...) csm_dp_log(LOG_WARNING, __VA_ARGS__)
-#define DP_LOG_ERR(...) csm_dp_log(LOG_ERR, __VA_ARGS__)
-#define DP_LOG_CRIT(...) csm_dp_log(LOG_CRIT, __VA_ARGS__)
+#define DP_LOG_DEBUG(handle,...) csm_dp_log(handle, LOG_DEBUG, __VA_ARGS__)
+#define DP_LOG_INFO(handle,...) csm_dp_log(handle, LOG_INFO, __VA_ARGS__)
+#define DP_LOG_WARN(handle,...) csm_dp_log(handle, LOG_WARNING, __VA_ARGS__)
+#define DP_LOG_ERR(handle,...) csm_dp_log(handle, LOG_ERR, __VA_ARGS__)
+#define DP_LOG_CRIT(handle,...) csm_dp_log(handle, LOG_CRIT, __VA_ARGS__)
 
 struct csm_dp_mempool_hdl;
 
@@ -46,9 +46,9 @@ struct csm_dp_mem_loc {
  *      	   released
  */
 struct csm_dp_mempool_ops {
-	void *(*alloc_buf)(struct csm_dp_mempool_hdl *);
-	void (*free_buf)(struct csm_dp_mempool_hdl *, void *);
-	void (*release)(struct csm_dp_mempool_hdl *);
+	void *(*alloc_buf)(uint16_t, struct csm_dp_mempool_hdl *);
+	void (*free_buf)(uint16_t, struct csm_dp_mempool_hdl *, void *);
+	void (*release)(uint16_t, struct csm_dp_mempool_hdl *);
 };
 
 /** @brief debug statistics for ring operation */
@@ -184,6 +184,7 @@ struct csm_dp_cap_event_hdl {
 /** @brief traffic capture handler
  *
  *  @param pid - pthread id of traffic capture thread
+ *  @param handle - Handle for a csm_dp instance
  *  @param event_hdl - event handler
  *  @param priv_data - private data to store user-provided
  *      	     cookie
@@ -193,6 +194,7 @@ struct csm_dp_cap_event_hdl {
  */
 struct csm_dp_cap_hdl {
 	pthread_t pid;
+	uint16_t handle;
 	struct csm_dp_cap_event_hdl event_hdl;
 	void *priv_data;
 	struct csm_dp_cap_cb_ops ops;
@@ -208,7 +210,12 @@ struct csm_dp_cap_hdl {
  *
  *  @param fd - DP device file descriptor
  *  @param flag - bitmap is defined by LIB_FLAG_XX macro
+ *  @param tx_buf_inprogress - tx buffer transmission progress
+ *  @param logcfg - log configuration
  *  @param mutex - mutex for data protection
+ *  @param tx_mutex - tx mutex
+ *  @param rx_c_mutex - rx control mutex
+ *  @param rx_d_mutex - rx data mutex
  *  @param hdl - mempool handler
  *  @param rxhdl - UL RX handler
  *  @param caphdl - capture handler
@@ -217,15 +224,19 @@ struct csm_dp_cap_hdl {
 struct csm_dp_lib_data {
 	int fd;
 	int flag;
+	unsigned int tx_buf_inprogress[CSM_DP_CH_DATA + 1];
 	struct csm_dp_log_cfg logcfg;
 	pthread_mutex_t mutex;
+	pthread_mutex_t tx_mutex;
+	pthread_mutex_t rx_c_mutex;
+	pthread_mutex_t rx_d_mutex;
 	struct csm_dp_mempool_hdl *hdl[CSM_DP_MEM_TYPE_LAST];
 	struct csm_dp_rx_hdl *rxhdl[CSM_DP_RX_TYPE_LAST];
 	struct csm_dp_cap_hdl *caphdl;
 };
 
 /** @brief library logging */
-void csm_dp_log(int level, const char *fmt, ...);
+void csm_dp_log(uint16_t handle, int level, const char *fmt, ...);
 
 #ifdef __cplusplus
 };

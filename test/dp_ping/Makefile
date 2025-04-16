@@ -11,7 +11,7 @@ PRODUCT := dp_ping
 DEPFLAGS = -MT $@ -MMD -MP -MF $*.tempd
 MVDEP = mv -f $*.tempd $*.d && touch $@
 
-CFLAGS += -fPIC -Wall -Wextra -I../../include
+CFLAGS += -Wall -Wextra -lbsd -I../../include -mcmodel=large
 LDFLAGS := -L/usr/local/lib -L../../ -lcsm_dp -lpthread -lrt
 
 SRCDIRS = src

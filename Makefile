@@ -20,7 +20,7 @@ CINCLUDE_ARCH = -I./include/arch/$(ARCH)
 endif
 
 # FLAGS
-CFLAGS +=-Wall -Wextra -fPIC
+CFLAGS +=-Wall -Wextra -fPIC -lpthread
 CINCLUDE += -I./include -I/usr/include
 CINCLUDE += $(CINCLUDE_ARCH)
 LDFLAGS := -shared

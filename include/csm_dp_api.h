@@ -11,12 +11,18 @@ extern "C" {
 #endif
 
 #include <stdint.h>
+#include <limits.h>
 #include <linux/csm_dp_ioctl.h>
 
 /** @brief macro for default buffer size */
 #define CSM_DP_DEFAULT_CONTROL_BUFSZ	(4 * 1024)
 #define CSM_DP_DEFAULT_DATA_BUFSZ		(64 * 1024)
 #define CSM_DP_CAPTURE_MAX_EVENT		(1024)
+
+#define CSM_DP_MAX_VF 4
+#define CSM_DP_MAX_BUS 4
+#define INVALID_HANDLE 0xFFFF
+#define CREATE_HANDLE(x, y) (x | (y << 4))
 
 /** @brief enum for library log output */
 enum {
@@ -36,6 +42,7 @@ struct csm_dp_log_cfg {
 };
 
 /** @brief message capture callback function
+ *  @param handle - Handle for a csm_dp instance
  *  @param cookie - cookie provided by user
  *  @param timestamp - message timestamp
  *  @param buf - message to capture
@@ -44,6 +51,7 @@ struct csm_dp_log_cfg {
  *  @param ch - Channel the message was captured on
  */
 typedef int (*csm_dp_cap_msg_cb)(
+	uint16_t handle,
 	void *cookie,
 	const struct timespec *timestamp,
 	const char *buf,
@@ -52,6 +60,7 @@ typedef int (*csm_dp_cap_msg_cb)(
 	enum csm_dp_channel ch);
 
 /** @brief scatter-gather message capture callback function
+ *  @param handle - Handle for a csm_dp instance
  *  @param cookie - cookie provided by user
  *  @param iov - scatter-gather iovec list
  *  @param iovcnt - number of iovec in list
@@ -61,6 +70,7 @@ typedef int (*csm_dp_cap_msg_cb)(
  *  @param total_len - total length of all iov buffers
  */
 typedef int (*csm_dp_cap_sg_msg_cb)(
+	uint16_t handle,
 	void *cookie,
 	const struct iovec *iov,
 	unsigned int iovcnt,
@@ -143,17 +153,28 @@ int csm_dp_init(const struct csm_dp_log_cfg *logcfg);
  * @return On success, it returns file descriptor of DP device
  *         If it fails, it returns negative value
  */
-int csm_dp_init_ex(const char *dev_name, const struct csm_dp_log_cfg *logcfg);
+int csm_dp_init_ex(const char *dev_name,
+		   const struct csm_dp_log_cfg *logcfg);
 
 /**
  * @brief
- * Cleanup the library. After it returns, all the mmaped DP
+ * Cleanup the library. After it returns, all the mmapped DP
  * memory areas are unmapped. Any attempt to access those memory
  * regions will cause page fault.
  *
  * @return None
  */
 void csm_dp_cleanup(void);
+/**
+ * @brief
+ * Cleanup the library based on vf. After it returns, all the
+ * mmapped DP memory areas are unmapped. Any attempt to access
+ * those memory regions will cause page fault.
+ *
+ * @param handle - Handle for a csm_dp instance
+ * @return None
+ */
+void csm_dp_cleanup_vf(uint16_t handle);
 
 /**
  * @brief
@@ -172,6 +193,7 @@ void csm_dp_cleanup(void);
  * The ring buffer is shared between kernel and API for buffer
  * management.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param type - type of DP memory region
  * @param buf_sz - size of buffer in bytes. It must be the
  *      	 multiples of 1K(1024)
@@ -181,6 +203,7 @@ void csm_dp_cleanup(void);
  * @return On success - 0, otherwise failed
  */
 int csm_dp_init_mem(
+	uint16_t handle,
 	enum csm_dp_mem_type type,
 	unsigned int buf_sz,
 	unsigned int buf_num);
@@ -193,11 +216,12 @@ int csm_dp_init_mem(
  * unmapped. On return of this api, any attempt to access this
  * DP memory region will cause page fault.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param type - type of DP memory region to cleanup
  *
  * @return None
  */
-void csm_dp_cleanup_mem(enum csm_dp_mem_type type);
+void csm_dp_cleanup_mem(uint16_t handle, enum csm_dp_mem_type type);
 
 /**
  * @brief
@@ -212,9 +236,10 @@ void csm_dp_cleanup_mem(enum csm_dp_mem_type type);
  * - mmap ring buffer for buffer management into user space
  * - mmap ring buffer for receiving queue into user space
  *
+ * @param handle - Handle for a csm_dp instance
  * @return On success - 0, otherwise failed
  */
-int csm_dp_init_rx(void);
+int csm_dp_init_rx(uint16_t handle);
 
 /**
  * @brief
@@ -224,12 +249,15 @@ int csm_dp_init_rx(void);
  * returns a buffer pointer that points to the starting of
  * message payload
  *
+ * @param handle - Handle for a csm_dp instance
  * @param type - type of DP memory region
  * @param length - length of buffer
  *
  * @return The buffer pointer or NULL if it fails.
  */
-void *csm_dp_alloc_txbuf(enum csm_dp_mem_type type, unsigned int length);
+void *csm_dp_alloc_txbuf(uint16_t handle,
+			 enum csm_dp_mem_type type,
+			 unsigned int length);
 
 /**
  * @brief
@@ -237,17 +265,18 @@ void *csm_dp_alloc_txbuf(enum csm_dp_mem_type type, unsigned int length);
  *
  * The library preserves headroom for the message header. It
  * returns a buffer pointer that points to the starting of
- * message payload. A unique handle is returned for further use
+ * message payload. A unique *handle is returned for further use
  * to query buffer status.
  *
+ * @param dev_handle - Handle for a csm_dp instance
  * @param type - type of DP memory region
  * @param length - length of buffer
- * @param handle  - pointer to the handle
+ * @param *handle  - pointer to the *handle
  *
  * @return The buffer pointer or NULL if it fails.
  */
-void *csm_dp_ealloc_txbuf(enum csm_dp_mem_type type, unsigned int length,
-		unsigned int *handle);
+void *csm_dp_ealloc_txbuf(uint16_t dev_handle, enum csm_dp_mem_type type,
+			  unsigned int length, unsigned int *handle);
 
 
 /** @brief enum for query tx buffer status */
@@ -263,7 +292,7 @@ typedef enum {
 					 */
 	CSM_DP_TX_BUF_STATUS_TX_QUERY_ERR,
 					/*
-					 * Query error. Unknown buffer handle.
+					 * Query error. Unknown buffer *handle.
 					 * User may have freed buffer.
 					 */
 	CSM_DP_TX_BUF_STATUS_TX_ERR,	/*
@@ -301,6 +330,7 @@ typedef enum {
  * free the buffer, the same buffer will not be allocated, until
  * transmission is complete.
  *
+ * @param dev_handle - Handle for a csm_dp instance
  * @param bufptr - buffer pointer. The buffer must have
  *               been allocated by csm_dp_ealloc_tx API.
  * @param handle - buffer handle. The buffer handle must have
@@ -314,8 +344,8 @@ typedef enum {
  *         of the emums represented by csm_dp_txbuf_status.
  */
 csm_dp_txbuf_status_e
-csm_dp_query_txbuf_status(unsigned int handle, void *bufptr, int *err);
-
+csm_dp_query_txbuf_status(uint16_t dev_handle, unsigned int handle,
+			  void *bufptr, int *err);
 
 /**
  * @brief
@@ -326,9 +356,12 @@ csm_dp_query_txbuf_status(unsigned int handle, void *bufptr, int *err);
  * If that is the case during the next allocation,
  * the buffer is not allocated and skipped.
  * Such counts are maintained by the library.
+ *
+ * @param handle - Handle for a csm_dp instance
  * @return number of instances when this happens.
  */
-unsigned int csm_dp_num_alloc_txbuf_tx_in_progress(void);
+unsigned int csm_dp_num_alloc_txbuf_tx_in_progress(uint16_t handle,
+						   enum csm_dp_channel mode);
 
 /**
  * @brief
@@ -340,17 +373,18 @@ unsigned int csm_dp_num_alloc_txbuf_tx_in_progress(void);
  * Note that in normal use case, Tx buffer is freed by the library as part of
  * send operation (see csm_dp_send).
  *
- * After freeing the buffer, the handle from the associated
+ * After freeing the buffer, the *handle from the associated
  * csm_dp_ealloc_txbuf() is destroyed. Next time, the same buffer is
  * returned by csm_dp_ealloc_txbuf(), it will be associated with a
  * different handle.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param bufptr - buffer pointer. The returned buffer must have
  *      	 been allocated by csm_dp_alloc_tx API.
  *
  * @return None
  */
-void csm_dp_free_unsent_txbuf(void *bufptr);
+void csm_dp_free_unsent_txbuf(uint16_t handle, void *bufptr);
 
 /**
  * @brief
@@ -371,6 +405,7 @@ void csm_dp_free_unsent_txbuf(void *bufptr);
  *
  * The library takes care of freeing the Tx buffers, unless CSM_DP_TX_FLAG_DONT_FREE is set.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param ch - channel to send on (CONTROL or DATA)
  * @param iov - pointer to any array of iovec structure
  * @param iovcnt - number of iovec structure in array
@@ -379,7 +414,8 @@ void csm_dp_free_unsent_txbuf(void *bufptr);
  *
  * @return Number of messages which were sent, or negative value
  */
-int csm_dp_send(enum csm_dp_channel ch, struct iovec *iov, unsigned int iovcnt, unsigned int flag);
+int csm_dp_send(uint16_t handle, enum csm_dp_channel ch, struct iovec *iov,
+		unsigned int iovcnt, unsigned int flag);
 
 /**
  * @brief
@@ -389,6 +425,7 @@ int csm_dp_send(enum csm_dp_channel ch, struct iovec *iov, unsigned int iovcnt, 
  * call csm_dp_rx_poll to fetch received UL packets. Failing to poll at the
  * appropriate rate will result in out of Rx buffers.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param iov - pointer to any array of iovec structure
  * @param iovcnt - number of iovec structure in array
  *
@@ -397,18 +434,21 @@ int csm_dp_send(enum csm_dp_channel ch, struct iovec *iov, unsigned int iovcnt, 
  * On success, the iov structure will be updated with the
  * message pointer and message length information
  */
-int csm_dp_rx_poll(struct iovec *iov, unsigned int iovcnt);
-
+int csm_dp_rx_poll(uint16_t handle,
+		   struct iovec *iov,
+		   unsigned int iovcnt);
 /**
  * @brief
  * Inline API to send a single message
  *
+ * @param handle - Handle for a csm_dp instance
  * @param ch - channel to send on (CONTROL or DATA)
  * @param msg - pointer to the message payload
  * @param msglen - length of message payload
  * @param flag - the same flag definition as csm_dp_send
  */
 static inline int csm_dp_send_single_msg(
+	uint16_t handle,
 	enum csm_dp_channel ch,
 	void *msg,
 	unsigned int msglen,
@@ -418,7 +458,7 @@ static inline int csm_dp_send_single_msg(
 
 	iov.iov_base = msg;
 	iov.iov_len = msglen;
-	return csm_dp_send(ch, &iov, 1, flag);
+	return csm_dp_send(handle, ch, &iov, 1, flag);
 }
 
 /**
@@ -431,6 +471,7 @@ static inline int csm_dp_send_single_msg(
  * It is a non-blocking API. For blocking receive, user should
  * do select before calling ths API.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param iov - pointer to any array of iovec structure
  * @param iovcnt - number of iovec structure in array
  *
@@ -440,7 +481,9 @@ static inline int csm_dp_send_single_msg(
  * On success, the iov structure will be updated with the
  * message pointer and message length information
  */
-int csm_dp_recv(struct iovec *iov, unsigned int iovcnt);
+int csm_dp_recv(uint16_t handle,
+		struct iovec *iov,
+		unsigned int iovcnt);
 
 /**
  * @brief
@@ -449,12 +492,13 @@ int csm_dp_recv(struct iovec *iov, unsigned int iovcnt);
  * After UL message is processed, the user application must use
  * this API to free the RX buffer.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param bufptr - buffer pointer. It must have been returned in
  *      	 iov_base field of iovec structure by
  *      	 csm_dp_recv API.
  * @return None
  */
-void csm_dp_free_rxbuf(void *bufptr);
+void csm_dp_free_rxbuf(uint16_t handle, void *bufptr);
 
 /**
  * @brief
@@ -465,6 +509,7 @@ void csm_dp_free_rxbuf(void *bufptr);
  * thread for each packet received/transmitted using library
  * API.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param callback_ops - callback ops. Set to NULL to use
  *      	   default callback in library which writes
  *      	   message into file.
@@ -476,7 +521,7 @@ void csm_dp_free_rxbuf(void *bufptr);
  * @return On success - 0, otherwise failed
  *
  */
-int csm_dp_init_capture(
+int csm_dp_init_capture(uint16_t handle,
 	const struct csm_dp_cap_cb_ops *cb_ops,
 	void *cb_cookie,
 	unsigned int max_event);
@@ -485,63 +530,98 @@ int csm_dp_init_capture(
  * @brief
  * To stop traffic capture and streaming.
  *
- * @param none
+ * @param handle - Handle for a csm_dp instance
  *
  * @return None
  */
-void csm_dp_cleanup_capture(void);
+void csm_dp_cleanup_capture(uint16_t handle);
 
 /**
  * @brief
  * To enable traffic capture on a specific channel
  *
+ * @param handle - Handle for a csm_dp instance
  * @param ch - channel for capture
  *
  * @return On success - 0, otherwise failed
  */
-int csm_dp_enable_capture(enum csm_dp_channel ch);
+int csm_dp_enable_capture(uint16_t handle, enum csm_dp_channel ch);
 
 /**
  * @brief
  * To disable traffic capture on a specific channel
  *
+ * @param handle - Handle for a csm_dp instance
  * @param ch - channel for capture
  *
  * @return On success - 0, otherwise failed
  */
-int csm_dp_disable_capture(enum csm_dp_channel ch);
+int csm_dp_disable_capture(uint16_t handle, enum csm_dp_channel ch);
 
 /**
  * @brief
  * To get thread id of the thread created by csm_dp_init_capture
  * API
  *
+ * @param handle - Handle for a csm_dp instance
  * @param tid - pointer to store the thread id
  *
  * @return On success - 0, otherwise failed
  */
-int csm_dp_get_capture_thread_tid(pthread_t *tid);
+int csm_dp_get_capture_thread_tid(uint16_t handle, pthread_t *tid);
 
 /**
  * @brief
  * Set the loglevel. The value of log level is defined in
  * syslog.h.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param loglevel - log level.
  *
  * @return On success - 0, otherwise failed
  */
-int csm_dp_set_loglevel(int loglevel);
+int csm_dp_set_loglevel(uint16_t handle, int loglevel);
 
 /**
  * @brief
  * Get driver layer statistics.
  *
+ * @param handle - Handle for a csm_dp instance
  * @param stats - statistics placeholder.
  *
  * @return On success - 0, otherwise failed
  */
-int csm_dp_get_stats(struct csm_dp_ioctl_getstats *stats);
+int csm_dp_get_stats(uint16_t handle, struct csm_dp_ioctl_getstats *stats);
+
+/**
+ * @brief
+ * Get device info handle.
+ *
+ * @param fd - file descriptor for vf.
+ *
+ * @return valid handle On success, otherwise INVALID_HANDLE returned
+ */
+uint16_t csm_dp_get_handle(int fd);
+
+/**
+ * @brief
+ * Get bus index based on the handle.
+ *
+ * @param handle - Handle for a csm_dp instance
+ *
+ * @return valid bus id On success, otherwise INVALID_HANDLE returned
+ */
+unsigned int csm_dp_get_bus_index(uint16_t handle);
+
+/**
+ * @brief
+ * Get vf index based on the handle.
+ *
+ * @param handle - Handle for a csm_dp instance
+ *
+ * @return valid vf id On success, otherwise INVALID_HANDLE returned
+ */
+unsigned int csm_dp_get_vf_index(uint16_t handle);
 
 #ifdef __cplusplus
 }
