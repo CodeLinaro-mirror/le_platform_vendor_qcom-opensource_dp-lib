@@ -1,8 +1,7 @@
 /*
-* Copyright (c) 2025 Qualcomm Innovation Center, Inc. All rights reserved.
-* SPDX-License-Identifier: BSD-3-Clause-Clear
-*/
-
+ * Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+ * SPDX-License-Identifier: BSD-3-Clause-Clear
+ */
 
 #ifndef CSM_DP_GENERIC_H
 #define CSM_DP_GENERIC_H
