@@ -696,6 +696,7 @@ static int __csm_init(uint16_t handle, enum csm_dp_channel mode)
 	unsigned int seg_size = cmdline_option.tx_length;
 	unsigned int bus = csm_dp_get_bus_index(handle);
 	unsigned int vf = csm_dp_get_vf_index(handle);
+	unsigned int last_sg_buf_size;
 	char dev_name[20];
 	int dl_mode = (mode == CSM_DP_CH_CONTROL) ? CSM_DP_MEM_TYPE_DL_CONTROL : CSM_DP_MEM_TYPE_DL_DATA;
 	struct csm_dp_log_cfg log_cfg = {
@@ -705,6 +706,16 @@ static int __csm_init(uint16_t handle, enum csm_dp_channel mode)
 
 	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
 		return -EINVAL;
+
+	/* If packet length is less than threshold, no scatter gather */
+	if (cmdline_option.tx_sg &&
+			cmdline_option.tx_length <
+				(sizeof(struct dp_ping_pkt_hdr) *
+					CSM_DP_MAX_SG_IOV_SIZE)) {
+		printf("TX packet length:%u is less than the SG threshold\n",
+			cmdline_option.tx_length);
+		cmdline_option.tx_sg = false;
+	}
 
 	if (cmdline_option.tx_sg)
 		seg_size /= CSM_DP_MAX_SG_IOV_SIZE;
@@ -722,10 +733,17 @@ static int __csm_init(uint16_t handle, enum csm_dp_channel mode)
 			CSM_DP_DEFAULT_DATA_BUFSZ : CSM_DP_DEFAULT_CONTROL_BUFSZ;
 	if (buf_size < seg_size)
 		buf_size = seg_size;
+
+	if (cmdline_option.tx_sg) {
+		last_sg_buf_size = cmdline_option.tx_length - (seg_size * (CSM_DP_MAX_SG_IOV_SIZE - 1));
+		if (last_sg_buf_size > buf_size)
+			buf_size = last_sg_buf_size;
+	}
+
 	buf_size = (buf_size + CSM_DP_L1_CACHE_BYTES - 1) &
 				~(CSM_DP_L1_CACHE_BYTES - 1);
 	if (buf_size > CSM_DP_MAX_DL_MSG_LEN) {
-		printf("request buffer size %d exceeds limit %d\n",
+		printf("request buffer size %u exceeds limit %d\n",
 			buf_size, CSM_DP_MAX_DL_MSG_LEN);
 		return -1;
 	}
@@ -1346,13 +1364,6 @@ static void *__tx_main(void *arg)
 			(dp_data->mode == CSM_DP_CH_DATA) ? "DATA" : "CONTROL", bus, vf,
 			thread_get_affinity(pthread_self()));
 	}
-
-	/* If packet length is less than threshold, no scatter gather */
-	if (cmdline_option.tx_sg &&
-			cmdline_option.tx_length <
-				(sizeof(struct dp_ping_pkt_hdr) *
-					CSM_DP_MAX_SG_IOV_SIZE))
-		cmdline_option.tx_sg = false;
 
 	driver_stats.ch = dp_data->mode ? CSM_DP_CH_DATA : CSM_DP_CH_CONTROL;
 	ret = csm_dp_get_stats(dp_handle, &driver_stats);
