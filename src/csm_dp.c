@@ -1428,7 +1428,7 @@ void csm_dp_cleanup_mem(uint16_t handle, enum csm_dp_mem_type type)
 	unsigned int bus = csm_dp_get_bus_index(handle);
 	unsigned int vf = csm_dp_get_vf_index(handle);
 
-	if (bus >= CSM_DP_MAX_BUS || CSM_DP_MAX_VF)
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
 		return;
 
 	DP_LOG_DEBUG(handle, "%s: type %d\n", __func__, type);
@@ -1956,7 +1956,7 @@ int csm_dp_rx_poll(uint16_t handle, struct iovec *iov, unsigned int iovcnt)
 	req.iov_len = iovcnt;
 	ret = ioctl(__libData[bus][vf].fd, CSM_DP_IOCTL_RX_POLL, &req);
 	if (ret < 0) {
-		DP_LOG_ERR(handle, "CSM_DP_IOCTL_RX_POLL failed %d\n", ret);
+		DP_LOG_DEBUG(handle, "CSM_DP_IOCTL_RX_POLL failed %d\n", ret);
 		pthread_mutex_unlock(&__libData[bus][vf].rx_d_mutex);
 		return ret;
 	}

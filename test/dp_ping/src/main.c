@@ -189,8 +189,8 @@ static struct csm_dp_app_data dp_app_control[CSM_DP_MAX_BUS][CSM_DP_MAX_VF];
 static struct csm_dp_app_data dp_app_data[CSM_DP_MAX_BUS][CSM_DP_MAX_VF];
 static uint32_t latency_bucket_time[NUM_LAT_BUCKET] = {125, 250, 500, 750, 1000, 1500, 2000, 4000};
 
-static unsigned int rx_affinity=5;
-static unsigned int tx_affinity=16;
+static unsigned int rx_affinity = 5;
+static unsigned int tx_affinity = 16;
 static bool app_initialized_data;
 static bool app_initialized_control;
 void dump_pkt(char *pkt, unsigned int len)
@@ -273,7 +273,7 @@ static int thread_set_affinity(pthread_t thread, uint16_t affinity)
 	cpu_set_t set;
 	int i;
 	int numcores = sysconf(_SC_NPROCESSORS_ONLN);
-	uint64_t affinity_mask = 1 << (affinity-1);
+	uint64_t affinity_mask = 1 << affinity;
 
 	if (!(affinity_mask & (((uint64_t)1 << numcores) - 1)))
 		return 0;
@@ -284,6 +284,30 @@ static int thread_set_affinity(pthread_t thread, uint16_t affinity)
 			__CPU_SET_S(i, sizeof(set), &set);
 	}
 	return pthread_setaffinity_np(thread, sizeof(set), &set);
+}
+
+static int thread_get_affinity(pthread_t thread)
+{
+	cpu_set_t set;
+	int numcores = sysconf(_SC_NPROCESSORS_ONLN);
+	int core_id, ret;
+
+	/* Clear the CPU set */
+	__CPU_ZERO_S(sizeof(set), &set);
+
+	/* Get the current CPU affinity mask for the thread */
+	ret = pthread_getaffinity_np(thread, sizeof(set), &set);
+	if (ret) {
+		printf("%s failed\n", __func__);
+		return -1;
+	}
+
+	for (core_id = 0; core_id < numcores; core_id++) {
+		if (__CPU_ISSET_S(core_id, sizeof(set), &set))
+			return core_id;
+	}
+
+	return -1;
 }
 
 static void __parse_cmdline(int argc, char *argv[]) {
@@ -694,7 +718,7 @@ static int __csm_init(uint16_t handle, enum csm_dp_channel mode)
 	}
 
 	if (!buf_size)
-		buf_size = cmdline_option.poll_mode ?
+		buf_size = mode ?
 			CSM_DP_DEFAULT_DATA_BUFSZ : CSM_DP_DEFAULT_CONTROL_BUFSZ;
 	if (buf_size < seg_size)
 		buf_size = seg_size;
@@ -759,7 +783,6 @@ static int __csm_init(uint16_t handle, enum csm_dp_channel mode)
 
 static void __csm_cleanup(uint16_t handle)
 {
-	printf("%s running\n", __func__);
 	if (cmdline_option.tx_capture)
 		csm_dp_cleanup_capture(handle);
 	csm_dp_cleanup();
@@ -849,6 +872,35 @@ static void __result_proc(struct csm_dp_app_data *dp_data)
 	}
 }
 
+void display_ping_print_report(void)
+{
+	int mode = cmdline_option.poll_mode;
+        int bus_index, vf_index;
+        struct csm_dp_app_data (*dp_data)[CSM_DP_MAX_VF] = NULL;
+
+	if (mode == CSM_DP_CH_CONTROL || cmdline_option.run_both) {
+		dp_data = dp_app_control;
+		for (bus_index = 0; bus_index < CSM_DP_MAX_BUS; bus_index++) {
+			for (vf_index = 0; vf_index < CSM_DP_MAX_VF; vf_index++) {
+				if (dp_data[bus_index][vf_index].fd < 0)
+					continue;
+				_ping_print_report(&dp_data[bus_index][vf_index]);
+			}
+		}
+	}
+
+	if (mode == CSM_DP_CH_DATA || cmdline_option.run_both) {
+		dp_data = dp_app_data;
+		for (bus_index = 0; bus_index < CSM_DP_MAX_BUS; bus_index++) {
+			for (vf_index = 0; vf_index < CSM_DP_MAX_VF; vf_index++) {
+				if (dp_data[bus_index][vf_index].fd < 0)
+					continue;
+				_ping_print_report(&dp_data[bus_index][vf_index]);
+			}
+		}
+	}
+}
+
 static void *__result_main(__attribute__((unused)) void *arg)
 {
 	int mode = cmdline_option.poll_mode;
@@ -863,6 +915,7 @@ static void *__result_main(__attribute__((unused)) void *arg)
 					if (dp_data[bus_index][vf_index].fd < 0)
 						continue;
 					__result_proc(&dp_data[bus_index][vf_index]);
+					done = dp_data[bus_index][vf_index].__done;
 				}
 			}
 		}
@@ -874,11 +927,12 @@ static void *__result_main(__attribute__((unused)) void *arg)
 					if (dp_data[bus_index][vf_index].fd < 0)
 						continue;
 					__result_proc(&dp_data[bus_index][vf_index]);
+					done = dp_data[bus_index][vf_index].__done;
 				}
 			}
 		}
-		done = dp_data[0][0].__done;
 	}
+	display_ping_print_report();
 	return NULL;
 }
 
@@ -1013,13 +1067,20 @@ static void *__rx_main(void *arg)
 	if (dp_handle == INVALID_HANDLE)
 		return NULL;
 
+	unsigned int bus = csm_dp_get_bus_index(dp_handle);
+	unsigned int vf = csm_dp_get_vf_index(dp_handle);
+
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return NULL;
+
 	if (cmdline_option.rx_affinity) {
-		ret = thread_set_affinity(pthread_self(), cmdline_option.rx_affinity);
+		ret = thread_set_affinity(pthread_self(), cmdline_option.rx_affinity++);
 		if (ret) {
-			printf("Set RX Thread affinity 0x%x failed\n", cmdline_option.rx_affinity);
+			printf("Set RX Thread affinity 0x%x failed\n", cmdline_option.rx_affinity - 1);
 			return NULL;
 		}
-		printf("Set RX thread CPU affinity to 0x%x\n", cmdline_option.rx_affinity);
+		printf("RX_CONTROL_%u_%u Thread assigned to CPU %d affinity\n",
+			bus, vf, thread_get_affinity(pthread_self()));
 	}
 	else {
 		ret = thread_set_affinity(pthread_self(), dp_data->rx_affinity);
@@ -1027,7 +1088,8 @@ static void *__rx_main(void *arg)
 			printf("Set RX Thread affinity 0x%x failed\n", dp_data->rx_affinity);
 			return NULL;
 		}
-		printf("RX Control thread assigned to CPU %d affinity\n", dp_data->rx_affinity);
+		printf("RX_CONTROL_%u_%u Thread assigned to CPU %d affinity\n",
+			bus, vf, thread_get_affinity(pthread_self()));
 	}
 
 	if (cmdline_option.rx_timeout < cmdline_option.tx_intval_us + RX_TIMEOUT_GUARD) {
@@ -1079,13 +1141,20 @@ static void *__rx_poll_main(void *arg)
 	if (dp_handle == INVALID_HANDLE)
 		return NULL;
 
+	unsigned int bus = csm_dp_get_bus_index(dp_handle);
+	unsigned int vf = csm_dp_get_vf_index(dp_handle);
+
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return NULL;
+
 	if (cmdline_option.rx_affinity) {
-		ret = thread_set_affinity(pthread_self(), cmdline_option.rx_affinity);
+		ret = thread_set_affinity(pthread_self(), cmdline_option.rx_affinity++);
 		if (ret) {
-			printf("Set RX Thread affinity 0x%x failed\n", cmdline_option.rx_affinity);
+			printf("Set RX Thread affinity 0x%x failed\n", cmdline_option.rx_affinity - 1);
 			return NULL;
 		}
-		printf("Set RX thread CPU affinity to 0x%x\n", cmdline_option.rx_affinity);
+		printf("RX_DATA_%u_%u Thread assigned to CPU %d affinity\n",
+			bus, vf, thread_get_affinity(pthread_self()));
 	}
 	else {
 		ret = thread_set_affinity(pthread_self(), dp_data->rx_affinity);
@@ -1093,13 +1162,13 @@ static void *__rx_poll_main(void *arg)
 			printf("Set RX Thread affinity 0x%x failed\n", dp_data->rx_affinity);
 			return NULL;
 		}
-		printf("RX Data thread assigned to CPU %d affinity\n", dp_data->rx_affinity);
+		printf("RX_DATA_%u_%u Thread assigned to CPU %d affinity\n",
+			bus, vf, thread_get_affinity(pthread_self()));
 	}
 
 	while (! dp_data->__done) {
 		ret = csm_dp_rx_poll(dp_handle, iov, CSM_DP_MAX_IOV_SIZE);
 		if (ret < 0) {
-			printf("csm_dp_rx_poll failed %d\n", ret);
 			continue;
 		}
 
@@ -1145,7 +1214,7 @@ static int __create_ping_pkt(uint16_t dp_handle,
 		if (!cmdline_option.tx_sg)
 			iov[i].iov_len = cmdline_option.tx_length;
 		iov[i].iov_base =
-			csm_dp_ealloc_txbuf(dp_handle, cmdline_option.poll_mode ? CSM_DP_MEM_TYPE_DL_DATA : CSM_DP_MEM_TYPE_DL_CONTROL, iov[i].iov_len, &iohandle[i]);
+			csm_dp_ealloc_txbuf(dp_handle, dp_data->mode ? CSM_DP_MEM_TYPE_DL_DATA : CSM_DP_MEM_TYPE_DL_CONTROL, iov[i].iov_len, &iohandle[i]);
 		if (!iov[i].iov_base) {
 			printf("csm_dp_alloc_txbuf failed\n");
 			return -1;
@@ -1251,13 +1320,21 @@ static void *__tx_main(void *arg)
 	if (dp_handle == INVALID_HANDLE)
 		return NULL;
 
+	unsigned int bus = csm_dp_get_bus_index(dp_handle);
+	unsigned int vf = csm_dp_get_vf_index(dp_handle);
+
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return NULL;
+
 	if (cmdline_option.tx_affinity) {
-		ret = thread_set_affinity(pthread_self(), cmdline_option.tx_affinity);
+		ret = thread_set_affinity(pthread_self(), cmdline_option.tx_affinity++);
 		if (ret) {
-			printf("Set TX Thread affinity 0x%x failed\n", cmdline_option.tx_affinity);
+			printf("Set TX Thread affinity 0x%x failed\n", cmdline_option.tx_affinity - 1);
 			return NULL;
 		}
-		printf("Set TX thread CPU affinity to 0x%x\n", cmdline_option.tx_affinity);
+		printf("TX_%s_%u_%u Thread assigned to CPU %d affinity\n",
+			(dp_data->mode == CSM_DP_CH_DATA) ? "DATA" : "CONTROL", bus, vf,
+			thread_get_affinity(pthread_self()));
 	}
 	else {
 		ret = thread_set_affinity(pthread_self(), dp_data->tx_affinity);
@@ -1265,7 +1342,9 @@ static void *__tx_main(void *arg)
 			printf("Set TX Thread affinity 0x%x failed\n", dp_data->tx_affinity);
 			return NULL;
 		}
-		printf("TX %s thread assigned to CPU %d affinity\n", (dp_data->mode == CSM_DP_CH_DATA) ? "DATA" : "CONTROL", dp_data->tx_affinity);
+		printf("TX_%s_%u_%u Thread assigned to CPU %d affinity\n",
+			(dp_data->mode == CSM_DP_CH_DATA) ? "DATA" : "CONTROL", bus, vf,
+			thread_get_affinity(pthread_self()));
 	}
 
 	/* If packet length is less than threshold, no scatter gather */
@@ -1360,8 +1439,6 @@ static int __rx_init(struct csm_dp_app_data *dp_data, enum csm_dp_channel mode)
 			snprintf(thread_name, sizeof(thread_name), "RX_DATA_%u_%u",
 				bus, vf);
 			pthread_setname_np(dp_data->tid[RX_THREAD], thread_name);
-			printf("%s created successfully\n", thread_name);
-			dp_data->rx_affinity = rx_affinity++;
 		}
 	}
 	else {
@@ -1371,7 +1448,6 @@ static int __rx_init(struct csm_dp_app_data *dp_data, enum csm_dp_channel mode)
 			snprintf(thread_name, sizeof(thread_name), "RX_CONTROL_%u_%u",
 				bus, vf);
 			pthread_setname_np(dp_data->tid[RX_THREAD], thread_name);
-			printf("%s created successfully\n", thread_name);
 		}
 	}
 
@@ -1399,7 +1475,6 @@ static int __tx_init(struct csm_dp_app_data *dp_data, enum csm_dp_channel mode)
 			snprintf(thread_name, sizeof(thread_name), "TX_DATA_%u_%u",
 				bus, vf);
 			pthread_setname_np(dp_data->tid[TX_THREAD], thread_name);
-			printf("%s created successfully\n", thread_name);
 		}
 	}
 	else {
@@ -1409,7 +1484,6 @@ static int __tx_init(struct csm_dp_app_data *dp_data, enum csm_dp_channel mode)
 			snprintf(thread_name, sizeof(thread_name), "TX_CONTROL_%u_%u",
 				bus, vf);
 			pthread_setname_np(dp_data->tid[TX_THREAD], thread_name);
-			printf("%s created successfully\n", thread_name);
 		}
 	}
 
