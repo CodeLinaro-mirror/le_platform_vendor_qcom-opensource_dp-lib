@@ -1,0 +1,9 @@
+Source: dp-lib
+Maintainer: ssurasan@qti.qualcomm.com
+Build-Depends: debhelper-compat (= 12)
+
+Package: dp-lib
+Architecture: all
+Depends: dp-driver
+Description: CSM DP Library
+ This package contains the dp-lib source files
