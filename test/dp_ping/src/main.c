@@ -18,6 +18,7 @@
 #include <errno.h>
 #include <getopt.h>
 #include <syslog.h>
+#include <signal.h>
 #include <bsd/string.h>
 
 #include "csm_dp_api.h"
@@ -185,14 +186,36 @@ struct csm_dp_cap_defcfg capcfg = {
 
 
 static pthread_t result_tid;
-static struct csm_dp_app_data dp_app_control[CSM_DP_MAX_BUS][CSM_DP_MAX_VF];
-static struct csm_dp_app_data dp_app_data[CSM_DP_MAX_BUS][CSM_DP_MAX_VF];
+
+/* Use dynamic allocation to avoid platform specific .bss relocation issues */
+static struct csm_dp_app_data (*dp_app_control)[CSM_DP_MAX_VF] = NULL;
+static struct csm_dp_app_data (*dp_app_data)[CSM_DP_MAX_VF] = NULL;
 static uint32_t latency_bucket_time[NUM_LAT_BUCKET] = {125, 250, 500, 750, 1000, 1500, 2000, 4000};
 
 static unsigned int rx_affinity = 5;
 static unsigned int tx_affinity = 16;
 static bool app_initialized_data;
 static bool app_initialized_control;
+static pthread_mutex_t alloc_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void cleanup_at_exit(void)
+{
+	/* Use atomic flag to prevent double-free in multi-threaded exit */
+	static volatile sig_atomic_t cleanup_done = 0;
+
+	if (__sync_bool_compare_and_swap(&cleanup_done, 0, 1)) {
+		if (dp_app_control) {
+			free(dp_app_control);
+			dp_app_control = NULL;
+		}
+		if (dp_app_data) {
+			free(dp_app_data);
+			dp_app_data = NULL;
+		}
+		pthread_mutex_destroy(&alloc_mutex);
+	}
+}
+
 void dump_pkt(char *pkt, unsigned int len)
 {
 	unsigned int i;
@@ -1225,6 +1248,8 @@ static int __create_ping_pkt(uint16_t dp_handle,
 		iov[CSM_DP_MAX_SG_IOV_SIZE - 1].iov_len = len;
 	}
 
+	num = (cmdline_option.tx_length -
+		sizeof(struct dp_ping_pkt_hdr)) / sizeof(uint32_t);
 	for (i = 0; i < iovcnt; i++) {
 
 		struct dp_ping_pkt_hdr *hdr = NULL;
@@ -1246,8 +1271,6 @@ static int __create_ping_pkt(uint16_t dp_handle,
 			memset(iov[i].iov_base, 0,  sizeof(struct dp_ping_pkt_hdr));
 		}
 
-		num = (cmdline_option.tx_length -
-			sizeof(struct dp_ping_pkt_hdr)) / sizeof(uint32_t);
 		if (cmdline_option.tx_sg)
 			continue;  /* do with verify option later*/
 		p = (uint32_t *)(hdr + 1);
@@ -1519,16 +1542,55 @@ static int create_dp_ping_instance(uint16_t handle, enum csm_dp_channel mode)
 	struct csm_dp_app_data (*dp_data)[CSM_DP_MAX_VF] = (mode == CSM_DP_CH_CONTROL) ? dp_app_control : dp_app_data;
 	bool *init = (mode == CSM_DP_CH_CONTROL) ? &app_initialized_control : &app_initialized_data;
 
+	/* Add bounds checking for bud and vf id */
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF) {
+		printf("Invalid bus/vf: %u/%u\n", bus, vf);
+		return -EINVAL;
+	}
+
+	/* Protect allocation with mutex to prevent race conditions */
+	pthread_mutex_lock(&alloc_mutex);
 	if(*init == false) {
-		for (i = 0; i < CSM_DP_MAX_BUS; i++){
-			for (j = 0; j < CSM_DP_MAX_VF; j++)
-				dp_data[i][j].fd = -1;
+		if (mode == CSM_DP_CH_CONTROL && !dp_app_control) {
+			dp_app_control = calloc(CSM_DP_MAX_BUS, sizeof(*dp_app_control));
+			if (!dp_app_control) {
+				pthread_mutex_unlock(&alloc_mutex);
+				printf("Failed to allocate memory for dp_app_control\n");
+				return -ENOMEM;
+			}
+			/* Initialize newly allocated structure */
+			for (i = 0; i < CSM_DP_MAX_BUS; i++) {
+				for (j = 0; j < CSM_DP_MAX_VF; j++)
+					dp_app_control[i][j].fd = -1;
+			}
+		} else if (mode == CSM_DP_CH_DATA && !dp_app_data) {
+			dp_app_data = calloc(CSM_DP_MAX_BUS, sizeof(*dp_app_data));
+			if (!dp_app_data) {
+				pthread_mutex_unlock(&alloc_mutex);
+				printf("Failed to allocate memory for dp_app_data\n");
+				return -ENOMEM;
+			}
+			/* Initialize newly allocated structure */
+			for (i = 0; i < CSM_DP_MAX_BUS; i++) {
+				for (j = 0; j < CSM_DP_MAX_VF; j++)
+					dp_app_data[i][j].fd = -1;
+			}
+		}
+
+		/* Re-fetch dp_data pointer after allocation */
+		dp_data = (mode == CSM_DP_CH_CONTROL) ? dp_app_control : dp_app_data;
+		if (!dp_data) {
+			pthread_mutex_unlock(&alloc_mutex);
+			printf("Failed to allocate memory for dp_data\n");
+			return -ENOMEM;
 		}
 		*init = true;
 	}
+	pthread_mutex_unlock(&alloc_mutex);
 
 	fd = __csm_init(handle, mode);
-	if (fd < 0) return -1;
+	if (fd < 0)
+		return -1;
 
 	dp_data[bus][vf].fd = fd;
 	dp_data[bus][vf].mode = mode;
@@ -1536,16 +1598,29 @@ static int create_dp_ping_instance(uint16_t handle, enum csm_dp_channel mode)
 	__csm_rx_drain(handle, mode);
 
 	if (__ping_result_fifo_init(&dp_data[bus][vf].__result_fifo,
-		cmdline_option.result_fifo_depth)) return -1;
+			cmdline_option.result_fifo_depth)) {
+		close(fd);
+		dp_data[bus][vf].fd = -1;
+		return -1;
+	}
 
 	if (__rx_init(&dp_data[bus][vf], mode)) {
 		printf("rx_init failed\n");
+		__ping_result_fifo_cleanup(&dp_data[bus][vf].__result_fifo);
+		__csm_cleanup(handle);
+		close(fd);
+		dp_data[bus][vf].fd = -1;
 		return -1;
 	}
 	if (__tx_init(&dp_data[bus][vf], mode)) {
-		pthread_cancel(dp_data[bus][vf].tid[RX_THREAD]);
-		__ping_result_fifo_cleanup(&dp_data[bus][vf].__result_fifo);
 		printf("tx_init failed\n");
+		dp_data[bus][vf].__done = true;
+		pthread_cancel(dp_data[bus][vf].tid[RX_THREAD]);
+		pthread_join(dp_data[bus][vf].tid[RX_THREAD], NULL);
+		__ping_result_fifo_cleanup(&dp_data[bus][vf].__result_fifo);
+		__csm_cleanup(handle);
+		close(fd);
+		dp_data[bus][vf].fd = -1;
 		return -1;
 	}
 	return 0;
@@ -1558,6 +1633,10 @@ int main(int argc, char *argv[])
 	unsigned int bus, vf;
 	uint16_t handle;
 	void *res;
+
+	/* Register cleanup handler */
+	atexit(cleanup_at_exit);
+
 	__parse_cmdline(argc, argv);
 
 	bus = cmdline_option.bus_num;
@@ -1616,5 +1695,6 @@ int main(int argc, char *argv[])
 			__csm_cleanup(handle);
 		}
 	}
+
 	return 0;
 }
