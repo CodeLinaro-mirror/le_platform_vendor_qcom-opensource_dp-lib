@@ -2313,6 +2313,8 @@ static int __csm_dp_rtx_hook(
 	unsigned int vf = csm_dp_get_vf_index(handle);
 	struct csm_dp_cap_event *event = NULL;
 	unsigned int n, sg_len = 0;
+	unsigned int ul_buf_size = 0;
+	struct csm_dp_mempool_hdl *hdl = NULL;
 
 	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
 		return -EINVAL;
@@ -2325,6 +2327,20 @@ static int __csm_dp_rtx_hook(
 	if (!caphdl->enable[ch]) {
 		return 0;
 	}
+
+	/* Get actual UL buffer size from the buffer's mempool */
+	if (event_id == DP_CAP_EVENT_UL_SG_MSG || event_id == DP_CAP_EVENT_UL_MSGS) {
+		if (iovcnt > 0 && iov[0].iov_base) {
+			hdl = __find_mempool(handle, iov[0].iov_base);
+			if (hdl)
+				ul_buf_size = hdl->mem_hdl.bufsz;
+			else
+				ul_buf_size = CSM_DP_DEFAULT_UL_BUF_SIZE; /* fallback */
+		} else
+			ul_buf_size = CSM_DP_DEFAULT_UL_BUF_SIZE; /* fallback */
+	}
+	DP_LOG_DEBUG(handle, "UL buf config: ul_buf_size: %d default: %d\n",
+		ul_buf_size, CSM_DP_DEFAULT_UL_BUF_SIZE);
 
 	event = __ring_get_cap_event(handle, &caphdl->event_hdl.free_ring);
 	if (!event)
@@ -2340,8 +2356,8 @@ static int __csm_dp_rtx_hook(
 
 		if (event_id == DP_CAP_EVENT_UL_SG_MSG) {
 			if (iov[n].iov_len == 0) {
-				sg_len += CSM_DP_DEFAULT_UL_BUF_SIZE;
-				event->msgs.iovec[n].iov_len = CSM_DP_DEFAULT_UL_BUF_SIZE;
+				sg_len += ul_buf_size;
+				event->msgs.iovec[n].iov_len = ul_buf_size;
 			} else {
 				if (event->msgs.iovec[n].iov_len > sg_len)
 					event->msgs.iovec[n].iov_len -= sg_len;
@@ -2770,4 +2786,87 @@ int csm_dp_get_stats(uint16_t handle, struct csm_dp_ioctl_getstats *stats)
 		DP_LOG_ERR(handle, "CSM_DP_IOCTL_GET_STATS failed, err=%d (%s)\n", ret, strerror(errno));
 
 	return ret;
+}
+
+/**
+ * @brief
+ * Get the active memory profile from driver
+ *
+ * This queries the driver to determine which memory profile
+ * is currently active. The profile affects UL buffer allocation
+ * in the driver. Applications can use this information for
+ * monitoring or logging purposes.
+ *
+ * @param handle - Handle for a csm_dp instance
+ * @return profile value (0=LOW_MEMORY, 1=BALANCED, 2=HIGH_PERFORMANCE),
+ *         or negative on error
+ */
+int csm_dp_get_active_profile(uint16_t handle)
+{
+	unsigned int bus = csm_dp_get_bus_index(handle);
+	unsigned int vf = csm_dp_get_vf_index(handle);
+	unsigned int profile;
+	int ret;
+
+	if (bus >= CSM_DP_MAX_BUS || vf >= CSM_DP_MAX_VF)
+		return -EINVAL;
+
+	if (!csm_dp_is_inited(handle)) {
+		DP_LOG_ERR(handle, "Library is not initialized!\n");
+		return -EAGAIN;
+	}
+
+	ret = ioctl(__libData[bus][vf].fd, CSM_DP_IOCTL_GET_PROFILE, &profile);
+	if (ret < 0) {
+		DP_LOG_DEBUG(handle, "Failed to get profile: %d (%s)\n", ret, strerror(errno));
+		return ret;
+	}
+
+	if (profile >= CSM_DP_PROFILE_MAX) {
+		DP_LOG_DEBUG(handle, "Invalid profile from driver: %u\n", profile);
+		return -EINVAL;
+	}
+
+	DP_LOG_DEBUG(handle, "Active profile: %s (%u)\n", csm_dp_profile_name(profile), profile);
+	return profile;
+}
+
+/**
+ * @brief
+ * Get the active memory profile parameters
+ *
+ * This queries the complete memory profile configuration including
+ * buffer sizes and counts for both control and data channels.
+ *
+ * @param handle - Handle for a csm_dp instance
+ * @param params - Pointer to structure to receive profile parameters
+ * @return 0 on success, negative on error
+ */
+int csm_dp_get_profile_params(uint16_t handle, struct csm_dp_profile_params *params)
+{
+	/* Profile table matching driver's configuration */
+	static const struct csm_dp_profile_params csm_dp_profiles[CSM_DP_PROFILE_MAX] =
+		CSM_DP_PROFILES_INIT;
+
+	int profile_id;
+
+	if (!params) {
+		DP_LOG_ERR(handle, "NULL params pointer\n");
+		return -EINVAL;
+	}
+
+	/* Get active profile */
+	profile_id = csm_dp_get_active_profile(handle);
+	if (profile_id < 0)
+		return profile_id;
+
+	/* Copy profile parameters */
+	memcpy(params, &csm_dp_profiles[profile_id], sizeof(*params));
+
+	DP_LOG_INFO(handle, "Profile %s: RX CTRL=%uBx%u, RX DATA=%uBx%u\n",
+	            csm_dp_profile_name(profile_id),
+	            params->ul_ctrl_buf_size, params->ul_ctrl_buf_count,
+	            params->ul_data_buf_size, params->ul_data_buf_count);
+
+	return 0;
 }

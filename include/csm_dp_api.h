@@ -623,6 +623,36 @@ unsigned int csm_dp_get_bus_index(uint16_t handle);
  */
 unsigned int csm_dp_get_vf_index(uint16_t handle);
 
+/**
+ * @brief
+ * Get the active memory profile from driver
+ *
+ * This queries the driver to determine which memory profile
+ * is currently active. The profile affects UL buffer allocation
+ * in the driver. Applications can use this information for
+ * monitoring or logging purposes.
+ *
+ * @param handle - Handle for a csm_dp instance
+ * @return profile value (0=LOW_MEMORY, 1=BALANCED, 2=HIGH_PERFORMANCE),
+ *         or negative on error
+ */
+int csm_dp_get_active_profile(uint16_t handle);
+
+/**
+ * @brief
+ * Get the active memory profile parameters
+ *
+ * This queries the complete memory profile configuration including
+ * buffer sizes and counts for both control and data channels.
+ * Applications can use this to determine actual UL buffer sizes
+ * for scatter-gather operations and buffer management.
+ *
+ * @param handle - Handle for a csm_dp instance
+ * @param params - Pointer to structure to receive profile parameters
+ * @return 0 on success, negative on error
+ */
+int csm_dp_get_profile_params(uint16_t handle, struct csm_dp_profile_params *params);
+
 #ifdef __cplusplus
 }
 #endif

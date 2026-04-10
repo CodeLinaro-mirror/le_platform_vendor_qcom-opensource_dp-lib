@@ -147,6 +147,7 @@ struct csm_dp_app_data {
 	struct csm_dp_cap_defcfg capcfg;
 	unsigned int rx_affinity;
 	unsigned int tx_affinity;
+	struct csm_dp_profile_params profile_params;  /* Cached profile params from driver */
 };
 
 static struct cmd_option cmdline_option = {
@@ -1027,19 +1028,24 @@ static int __validate_rx_sg(struct iovec *iov, int n, int start_index, struct cs
 	uint16_t dp_handle = csm_dp_get_handle(dp_data->fd);
 	int i;
 	char *s = dp_data->_sg_rx_buf;
+	unsigned int ul_buf_size;
+
+	/* Use cached UL buffer size from profile params (set during initialization) */
+	ul_buf_size = (dp_data->mode == CSM_DP_CH_DATA) ?
+		dp_data->profile_params.ul_data_buf_size : dp_data->profile_params.ul_ctrl_buf_size;
 
 	for (i = start_index; i < n; i++) {
 		if (cmdline_option.verbose)
 			printf("sg recv [%d/%d]: len %ld\n", i + 1, n, iov[i].iov_len);
 		if (iov[i].iov_len == 0) {
-			sg_len += CSM_DP_DEFAULT_UL_BUF_SIZE;
+			sg_len += ul_buf_size;
 			// for checksum verification, copy the whole packet into contiguous buffer.
 			// otherwise, copy only packet header
 			if (cmdline_option.verify)
-				memcpy(s, iov[i].iov_base, CSM_DP_DEFAULT_UL_BUF_SIZE);
+				memcpy(s, iov[i].iov_base, ul_buf_size);
 			else if (i == start_index)
 				memcpy(s, iov[i].iov_base, sizeof(struct dp_ping_pkt_hdr));
-			s += CSM_DP_DEFAULT_UL_BUF_SIZE;
+			s += ul_buf_size;
 
 			csm_dp_free_rxbuf(dp_handle, iov[i].iov_base);
 			continue;
@@ -1052,9 +1058,9 @@ static int __validate_rx_sg(struct iovec *iov, int n, int start_index, struct cs
 		if (cmdline_option.verify)
 			memcpy(s, iov[i].iov_base, iov[i].iov_len);
 
-		if (sg_len != cmdline_option.tx_length) {
-			printf("sg recv length %u doesn't match expected %u\n", sg_len, cmdline_option.tx_length);
-		}
+		if (sg_len != cmdline_option.tx_length)
+			printf("sg recv length %u doesn't match expected %u\n", sg_len,
+				cmdline_option.tx_length);
 
 		__validate_rx_buf((struct dp_ping_pkt_hdr *)dp_data->_sg_rx_buf, dp_data);
 
@@ -1595,6 +1601,17 @@ static int create_dp_ping_instance(uint16_t handle, enum csm_dp_channel mode)
 	dp_data[bus][vf].fd = fd;
 	dp_data[bus][vf].mode = mode;
 	dp_data[bus][vf].stats.first_result = true;
+
+	/* Cache profile params once during initialization */
+	if (csm_dp_get_profile_params(handle, &dp_data[bus][vf].profile_params) != 0) {
+		printf("Warning: Failed to get profile params, using platform defaults\n");
+		/* Set default values if query fails */
+		dp_data[bus][vf].profile_params.ul_ctrl_buf_size = CSM_DP_DEFAULT_UL_BUF_SIZE;
+		dp_data[bus][vf].profile_params.ul_data_buf_size = CSM_DP_DEFAULT_UL_BUF_SIZE;
+		dp_data[bus][vf].profile_params.ul_ctrl_buf_count = CSM_DP_DEFAULT_UL_CTRL_BUF_CNT;
+		dp_data[bus][vf].profile_params.ul_data_buf_count = CSM_DP_DEFAULT_UL_DATA_BUF_CNT;
+	}
+
 	__csm_rx_drain(handle, mode);
 
 	if (__ping_result_fifo_init(&dp_data[bus][vf].__result_fifo,
