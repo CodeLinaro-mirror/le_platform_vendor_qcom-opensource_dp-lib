@@ -679,12 +679,12 @@ static void _ping_print_report(struct csm_dp_app_data *dp_data)
 		printf("  Rx, Good Checksum     :       %u\n", dp_data->stats._num_good_checksum);
 	}
 	if (dp_data->stats._num_rcv && cmdline_option.latency_stat) {
-		printf("Long Term Average latency  :       %ld us\n",
+		printf("Long Term Average latency  :       %lu us\n",
 						 dp_data->stats._total_latency / dp_data->stats._num_rcv);
 		if (dp_data->stats._this_report_num_rcv) {
-			printf("Min latency@this period     :       %ld us\n",
+			printf("Min latency@this period     :       %lu us\n",
 						dp_data->stats._min_latency);
-			printf("Max latency@this period     :       %ld us\n",
+			printf("Max latency@this period     :       %lu us\n",
 						dp_data->stats._max_latency);
 			printf("\n\nLatency Distribution\n");
 			printf("\n");
@@ -700,7 +700,7 @@ static void _ping_print_report(struct csm_dp_app_data *dp_data)
 						dp_data->stats._this_report_num_rcv);
 	}
 	dp_data->stats._this_report_num_rcv = 0;
-	dp_data->stats._min_latency = 0xffffffff;
+	dp_data->stats._min_latency = UINT64_MAX;
 	dp_data->stats._max_latency = 0;
 }
 
@@ -861,9 +861,6 @@ static void __result_proc(struct csm_dp_app_data *dp_data)
 {
 	uint64_t latency;
 	int i;
-
-	dp_data->stats._max_latency = 0;
-	dp_data->stats._min_latency = 0xffffffff;
 
 	struct ping_result result;
 
@@ -1601,6 +1598,8 @@ static int create_dp_ping_instance(uint16_t handle, enum csm_dp_channel mode)
 	dp_data[bus][vf].fd = fd;
 	dp_data[bus][vf].mode = mode;
 	dp_data[bus][vf].stats.first_result = true;
+	dp_data[bus][vf].stats._max_latency = 0;
+	dp_data[bus][vf].stats._min_latency = UINT64_MAX;
 
 	/* Cache profile params once during initialization */
 	if (csm_dp_get_profile_params(handle, &dp_data[bus][vf].profile_params) != 0) {
