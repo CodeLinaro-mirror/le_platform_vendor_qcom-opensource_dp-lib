@@ -1542,7 +1542,7 @@ static int create_dp_ping_instance(uint16_t handle, enum csm_dp_channel mode)
 	int fd, i, j;
 	unsigned int bus = csm_dp_get_bus_index(handle);
 	unsigned int vf = csm_dp_get_vf_index(handle);
-	struct csm_dp_app_data (*dp_data)[CSM_DP_MAX_VF] = (mode == CSM_DP_CH_CONTROL) ? dp_app_control : dp_app_data;
+	struct csm_dp_app_data (*dp_data)[CSM_DP_MAX_VF] = NULL;
 	bool *init = (mode == CSM_DP_CH_CONTROL) ? &app_initialized_control : &app_initialized_data;
 
 	/* Add bounds checking for bud and vf id */
@@ -1588,6 +1588,13 @@ static int create_dp_ping_instance(uint16_t handle, enum csm_dp_channel mode)
 			return -ENOMEM;
 		}
 		*init = true;
+	} else {
+		dp_data = (mode == CSM_DP_CH_CONTROL) ? dp_app_control : dp_app_data;
+		if (!dp_data) {
+			pthread_mutex_unlock(&alloc_mutex);
+			printf("dp_data NULL despite init flag set\n");
+			return -EINVAL;
+		}
 	}
 	pthread_mutex_unlock(&alloc_mutex);
 
