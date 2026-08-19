@@ -2338,9 +2338,10 @@ static int __csm_dp_rtx_hook(
 				ul_buf_size = CSM_DP_DEFAULT_UL_BUF_SIZE; /* fallback */
 		} else
 			ul_buf_size = CSM_DP_DEFAULT_UL_BUF_SIZE; /* fallback */
+
+		DP_LOG_DEBUG(handle, "UL buf config: ul_buf_size: %u default: %u\n",
+			ul_buf_size, CSM_DP_DEFAULT_UL_BUF_SIZE);
 	}
-	DP_LOG_DEBUG(handle, "UL buf config: ul_buf_size: %d default: %d\n",
-		ul_buf_size, CSM_DP_DEFAULT_UL_BUF_SIZE);
 
 	event = __ring_get_cap_event(handle, &caphdl->event_hdl.free_ring);
 	if (!event)
